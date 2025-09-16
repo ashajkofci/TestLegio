@@ -1,0 +1,13 @@
+# Flow Cytometry Denoising Pipeline Requirements
+# 
+# Install using apt (Ubuntu/Debian):
+# sudo apt install -y python3-numpy python3-pandas python3-matplotlib python3-seaborn python3-sklearn
+#
+# Or using pip (if available):
+# pip install -r requirements.txt
+
+numpy>=1.21.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+scikit-learn>=1.0.0
