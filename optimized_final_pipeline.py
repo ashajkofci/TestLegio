@@ -249,26 +249,42 @@ class OptimizedFlowCytometryPipeline:
                 print(f"  ✗ {alg_name} training failed: {e}")
                 self.training_times[alg_name] = 0
         
-        # Train Bayesian methods
-        print("Training Bayesian Temporal Methods...")
-        start_time = time.time()
-        try:
-            feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
-            if X_train.shape[1] >= len(feature_names):
-                X_df = pd.DataFrame(X_train, columns=feature_names)
-            else:
-                X_df = pd.DataFrame(X_train)
-                X_df['TIME'] = np.arange(len(X_train))
-                X_df.columns = feature_names[:X_train.shape[1]] + ['TIME']
-            
-            bayesian_denoiser = BayesianTemporalDenoiser(method='temporal_cooccurrence')
-            bayesian_denoiser.fit(X_df)
-            self.trained_models['bayesian_temporal'] = bayesian_denoiser
-            self.training_times['bayesian_temporal'] = time.time() - start_time
-            print(f"  ✓ Bayesian methods trained in {self.training_times['bayesian_temporal']:.2f}s")
-        except Exception as e:
-            print(f"  ✗ Bayesian training failed: {e}")
-            self.training_times['bayesian_temporal'] = 0
+        # Train multiple Bayesian methods
+        print("Training Advanced Bayesian Methods...")
+        bayesian_methods = [
+            'temporal_cooccurrence',
+            'bayesian_mixture', 
+            'bayesian_ridge',
+            'dirichlet_process',
+            'change_point_detection',
+            'ensemble_bayesian'
+        ]
+        
+        for method in bayesian_methods:
+            start_time = time.time()
+            try:
+                feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
+                if X_train.shape[1] >= len(feature_names):
+                    X_df = pd.DataFrame(X_train, columns=feature_names)
+                else:
+                    X_df = pd.DataFrame(X_train)
+                    X_df['TIME'] = np.arange(len(X_train))
+                    X_df.columns = feature_names[:X_train.shape[1]] + ['TIME']
+                
+                bayesian_denoiser = BayesianTemporalDenoiser(
+                    method=method,
+                    time_window=1000,
+                    n_components_max=min(15, len(X_train) // 50)  # Adaptive components
+                )
+                bayesian_denoiser.fit(X_df)
+                
+                self.trained_models[f'bayesian_{method}'] = bayesian_denoiser
+                self.training_times[f'bayesian_{method}'] = time.time() - start_time
+                print(f"  ✓ Bayesian {method} trained in {self.training_times[f'bayesian_{method}']:.2f}s")
+                
+            except Exception as e:
+                print(f"  ✗ Bayesian {method} training failed: {e}")
+                self.training_times[f'bayesian_{method}'] = 0
         
         # Create ensemble methods
         self._create_ensemble_methods()
@@ -375,8 +391,8 @@ class OptimizedFlowCytometryPipeline:
             unique_labels, counts = np.unique(labels, return_counts=True)
             noise_cluster = unique_labels[np.argmin(counts)]
             y_pred = (labels == noise_cluster).astype(int)
-        elif alg_name == 'bayesian_temporal':
-            # Use DataFrame for Bayesian method
+        elif alg_name.startswith('bayesian_'):
+            # Handle all Bayesian methods
             feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
             X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
             if 'TIME' not in X_df.columns:
@@ -450,7 +466,7 @@ class OptimizedFlowCytometryPipeline:
         predictions = []
         weights = []
         
-        # Simple weights based on algorithm type (could be improved with validation data)
+        # Enhanced weights based on algorithm type and expected performance
         algorithm_weights = {
             'isolation_forest': 1.0,
             'lof': 1.0,
@@ -458,7 +474,12 @@ class OptimizedFlowCytometryPipeline:
             'elliptic_envelope': 0.9,
             'gaussian_mixture': 1.1,
             'dbscan': 1.2,
-            'bayesian_temporal': 1.0
+            'bayesian_temporal_cooccurrence': 1.3,
+            'bayesian_bayesian_mixture': 1.4,
+            'bayesian_bayesian_ridge': 1.2,
+            'bayesian_dirichlet_process': 1.5,
+            'bayesian_change_point_detection': 1.1,
+            'bayesian_ensemble_bayesian': 1.6  # Highest weight for ensemble
         }
         
         for alg_name, model in self.trained_models.items():
@@ -512,7 +533,7 @@ class OptimizedFlowCytometryPipeline:
                     unique_labels, counts = np.unique(labels, return_counts=True)
                     noise_cluster = unique_labels[np.argmin(counts)]
                     pred = (labels == noise_cluster).astype(int)
-                elif alg_name == 'bayesian_temporal':
+                elif alg_name.startswith('bayesian_'):
                     feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
                     X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
                     if 'TIME' not in X_df.columns:
@@ -700,7 +721,7 @@ class OptimizedFlowCytometryPipeline:
             unique_labels, counts = np.unique(labels, return_counts=True)
             noise_cluster = unique_labels[np.argmin(counts)]
             return (labels == noise_cluster).astype(int)
-        elif alg_name == 'bayesian_temporal':
+        elif alg_name.startswith('bayesian_'):
             feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
             X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
             if 'TIME' not in X_df.columns:
