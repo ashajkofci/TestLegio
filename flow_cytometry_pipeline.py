@@ -269,9 +269,12 @@ class FlowCytometryPipeline:
             'minmax': MinMaxScaler()
         }
         
-        # True labels (0 = full_measurement, 1 = noise_only)
-        y_true = (self.filtered_data['source'] == 'noise_only').astype(int)
+        # True labels - CORRECTED: full_measurement.fcs contains the noise data
+        # Based on user clarification: only_noise.fcs has very few points >2e4 (normal data)
+        # full_measurement.fcs has many points >2e4 (noise data)
+        y_true = (self.filtered_data['source'] == 'full_measurement').astype(int)
         print(f"True noise samples: {y_true.sum()} / {len(y_true)} ({100 * y_true.mean():.1f}%)")
+        print(f"Data interpretation: full_measurement.fcs = noise, only_noise.fcs = normal")
         
         # Test different scalers and find best one
         best_scaler_name = 'standard'
@@ -554,35 +557,22 @@ class FlowCytometryPipeline:
         plt.show()
     
     def implement_advanced_denoising(self):
-        """Implement advanced denoising techniques with the best performing method."""
+        """Implement advanced denoising techniques with comprehensive metrics for ALL methods."""
         print("\n" + "="*50)
-        print("ADVANCED DENOISING IMPLEMENTATION")
+        print("COMPREHENSIVE DENOISING ANALYSIS - ALL METHODS")
         print("="*50)
         
-        # Find the best performing method from detection results
+        # Find all detection columns
         detection_cols = [col for col in self.filtered_data.columns if col.endswith('_tuned') or col in ['one_class_svm', 'elliptic_envelope', 'gaussian_mixture', 'ensemble_advanced']]
         
-        best_method = 'ensemble_advanced'  # Default to ensemble
-        print(f"Using best method: {best_method}")
-        
-        # Create denoised dataset
-        if best_method in self.filtered_data.columns:
-            noise_mask = self.filtered_data[best_method] == 1
-        else:
-            print(f"Warning: {best_method} not found, using ensemble_advanced")
-            noise_mask = self.filtered_data['ensemble_advanced'] == 1
-            
-        denoised_data = self.filtered_data[~noise_mask].copy()
-        
-        print(f"Original filtered data: {len(self.filtered_data)} events")
-        print(f"Detected noise events: {noise_mask.sum()} events")
-        print(f"Denoised data: {len(denoised_data)} events")
-        print(f"Removed {100 * noise_mask.sum() / len(self.filtered_data):.1f}% of data as noise")
-        
-        # Calculate comprehensive metrics for all methods
-        true_noise_mask = self.filtered_data['source'] == 'noise_only'
+        # Calculate comprehensive metrics for ALL methods
+        true_noise_mask = self.filtered_data['source'] == 'full_measurement'  # full_measurement.fcs contains noise data
         
         all_metrics = {}
+        print(f"\nComprehensive Performance Metrics for ALL Methods:")
+        print(f"{'Method':<25} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'TP':<5} {'FP':<5} {'TN':<5} {'FN':<5}")
+        print("-" * 100)
+        
         for method_col in detection_cols:
             if method_col in self.filtered_data.columns:
                 method_noise_mask = self.filtered_data[method_col] == 1
@@ -607,24 +597,90 @@ class FlowCytometryPipeline:
                     'true_negatives': tn,
                     'false_negatives': fn
                 }
+                
+                # Print metrics for this method
+                print(f"{method_col:<25} {accuracy:<10.3f} {precision:<10.3f} {recall:<10.3f} {f1_score:<10.3f} {tp:<5} {fp:<5} {tn:<5} {fn:<5}")
+        
+        # Implement voting ensemble method
+        print(f"\n" + "="*50)
+        print("VOTING ENSEMBLE METHOD")
+        print("="*50)
+        
+        # Get all prediction columns except the existing ensemble
+        voting_cols = [col for col in detection_cols if col != 'ensemble_advanced']
+        
+        if len(voting_cols) >= 2:
+            # Simple majority voting
+            predictions_array = self.filtered_data[voting_cols].values
+            majority_votes = (predictions_array.sum(axis=1) > len(voting_cols) / 2).astype(int)
+            
+            # Weighted voting based on F1-scores
+            weights = np.array([all_metrics[col]['f1_score'] for col in voting_cols])
+            if weights.sum() > 0:
+                weights = weights / weights.sum()
+            else:
+                weights = np.ones(len(weights)) / len(weights)
+            
+            weighted_votes = np.average(predictions_array, weights=weights, axis=1)
+            weighted_ensemble = (weighted_votes > 0.5).astype(int)
+            
+            # Add voting results to dataframe
+            self.filtered_data['voting_majority'] = majority_votes
+            self.filtered_data['voting_weighted'] = weighted_ensemble
+            
+            # Calculate metrics for voting methods
+            for vote_method, vote_pred in [('voting_majority', majority_votes), ('voting_weighted', weighted_ensemble)]:
+                method_noise_mask = vote_pred == 1
+                
+                tp = (method_noise_mask & true_noise_mask).sum()
+                fp = (method_noise_mask & ~true_noise_mask).sum()
+                tn = (~method_noise_mask & ~true_noise_mask).sum()
+                fn = (~method_noise_mask & true_noise_mask).sum()
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                accuracy = (tp + tn) / (tp + fp + tn + fn) if (tp + fp + tn + fn) > 0 else 0
+                
+                all_metrics[vote_method] = {
+                    'accuracy': accuracy,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1_score': f1_score,
+                    'true_positives': tp,
+                    'false_positives': fp,
+                    'true_negatives': tn,
+                    'false_negatives': fn
+                }
+                
+                print(f"{vote_method:<25} {accuracy:<10.3f} {precision:<10.3f} {recall:<10.3f} {f1_score:<10.3f} {tp:<5} {fp:<5} {tn:<5} {fn:<5}")
+            
+            print(f"\nVoting Ensemble Details:")
+            print(f"  - Methods used: {', '.join(voting_cols)}")
+            print(f"  - Weights (F1-based): {dict(zip(voting_cols, weights))}")
         
         # Find best method by F1 score
         best_f1_method = max(all_metrics.keys(), key=lambda x: all_metrics[x]['f1_score'])
         
-        print(f"\nBest performing method by F1-score: {best_f1_method}")
+        print(f"\n" + "="*50)
+        print("BEST METHOD SELECTION AND FINAL DENOISING")
+        print("="*50)
+        print(f"Best performing method by F1-score: {best_f1_method}")
         print(f"F1-Score: {all_metrics[best_f1_method]['f1_score']:.3f}")
         
-        # Print comparison table
-        print(f"\nPerformance Comparison:")
-        print(f"{'Method':<20} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10}")
-        print("-" * 60)
-        
-        for method, metrics in all_metrics.items():
-            print(f"{method:<20} {metrics['accuracy']:<10.3f} {metrics['precision']:<10.3f} {metrics['recall']:<10.3f} {metrics['f1_score']:<10.3f}")
-        
         # Use best method for final denoising
-        final_noise_mask = self.filtered_data[best_f1_method] == 1
+        if best_f1_method in self.filtered_data.columns:
+            final_noise_mask = self.filtered_data[best_f1_method] == 1
+        else:
+            # Fallback to ensemble_advanced if available
+            final_noise_mask = self.filtered_data.get('ensemble_advanced', 0) == 1
+            
         final_denoised_data = self.filtered_data[~final_noise_mask].copy()
+        
+        print(f"Original filtered data: {len(self.filtered_data)} events")
+        print(f"Detected noise events: {final_noise_mask.sum()} events")
+        print(f"Denoised data: {len(final_denoised_data)} events")
+        print(f"Removed {100 * final_noise_mask.sum() / len(self.filtered_data):.1f}% of data as noise")
         
         # Compare distributions before and after denoising
         self.compare_advanced_distributions(final_denoised_data)
@@ -691,12 +747,12 @@ class FlowCytometryPipeline:
     def generate_advanced_report(self, detection_accuracies, all_metrics, best_method):
         """Generate a comprehensive advanced report of the pipeline results."""
         print("\n" + "="*80)
-        print("ADVANCED FLOW CYTOMETRY DENOISING PIPELINE - FINAL REPORT")
+        print("ADVANCED FLOW CYTOMETRY DENOISING PIPELINE - COMPREHENSIVE REPORT")
         print("="*80)
         
         print(f"\n1. DATA LOADING AND PREPROCESSING:")
-        print(f"   - Full measurement file: {len(self.full_data)} events")
-        print(f"   - Noise-only file: {len(self.noise_data)} events")
+        print(f"   - Full measurement file: {len(self.full_data)} events (contains noise data)")
+        print(f"   - Only noise file: {len(self.noise_data)} events (contains normal data)")
         print(f"   - Combined dataset: {len(self.combined_data)} events")
         print(f"   - After FL1 > {self.fl1_threshold:.0e} filtering: {len(self.filtered_data)} events")
         
@@ -705,63 +761,89 @@ class FlowCytometryPipeline:
         for method, accuracy in sorted_methods:
             print(f"   - {method.replace('_', ' ').title()}: {accuracy:.3f}")
         
-        print(f"\n3. BEST METHOD SELECTION:")
+        print(f"\n3. COMPREHENSIVE PERFORMANCE METRICS - ALL METHODS:")
+        print(f"   (Note: True noise = events from full_measurement.fcs)")
+        print(f"   {'Method':<25} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10}")
+        print(f"   {'-'*80}")
+        
+        # Sort by F1-score for display
+        sorted_metrics = sorted(all_metrics.items(), key=lambda x: x[1]['f1_score'], reverse=True)
+        for method, metrics in sorted_metrics:
+            print(f"   {method:<25} {metrics['accuracy']:<10.3f} {metrics['precision']:<10.3f} {metrics['recall']:<10.3f} {metrics['f1_score']:<10.3f}")
+        
+        print(f"\n4. VOTING ENSEMBLE METHODS:")
+        voting_methods = [method for method in all_metrics.keys() if method.startswith('voting_')]
+        if voting_methods:
+            for vote_method in voting_methods:
+                metrics = all_metrics[vote_method]
+                print(f"   - {vote_method.replace('_', ' ').title()}:")
+                print(f"     * Accuracy: {metrics['accuracy']:.3f}")
+                print(f"     * Precision: {metrics['precision']:.3f}")
+                print(f"     * Recall: {metrics['recall']:.3f}")
+                print(f"     * F1-Score: {metrics['f1_score']:.3f}")
+        else:
+            print(f"   - No voting methods implemented")
+        
+        print(f"\n5. BEST METHOD SELECTION:")
         print(f"   - Best performing method: {best_method}")
         print(f"   - Selection criteria: Highest F1-Score")
         
-        print(f"\n4. COMPREHENSIVE DENOISING PERFORMANCE:")
-        best_metrics = all_metrics[best_method]
-        print(f"   Best Method ({best_method}):")
-        print(f"   - Accuracy: {best_metrics['accuracy']:.3f}")
-        print(f"   - Precision: {best_metrics['precision']:.3f}")
-        print(f"   - Recall: {best_metrics['recall']:.3f}")
-        print(f"   - F1-Score: {best_metrics['f1_score']:.3f}")
-        print(f"   - True Positives: {best_metrics['true_positives']}")
-        print(f"   - False Positives: {best_metrics['false_positives']}")
-        print(f"   - True Negatives: {best_metrics['true_negatives']}")
-        print(f"   - False Negatives: {best_metrics['false_negatives']}")
+        print(f"\n6. DETAILED PERFORMANCE FOR BEST METHOD ({best_method}):")
+        if best_method in all_metrics:
+            best_metrics = all_metrics[best_method]
+            print(f"   - Accuracy: {best_metrics['accuracy']:.3f}")
+            print(f"   - Precision: {best_metrics['precision']:.3f}")
+            print(f"   - Recall: {best_metrics['recall']:.3f}")
+            print(f"   - F1-Score: {best_metrics['f1_score']:.3f}")
+            print(f"   - True Positives: {best_metrics['true_positives']}")
+            print(f"   - False Positives: {best_metrics['false_positives']}")
+            print(f"   - True Negatives: {best_metrics['true_negatives']}")
+            print(f"   - False Negatives: {best_metrics['false_negatives']}")
         
-        print(f"\n5. HYPERPARAMETER TUNING RESULTS:")
+        print(f"\n7. HYPERPARAMETER TUNING RESULTS:")
         if hasattr(self, 'best_params') and self.best_params:
             for method, params in self.best_params.items():
                 print(f"   {method.replace('_', ' ').title()}:")
                 print(f"     - Best Score: {params['best_score']:.3f}")
                 print(f"     - Best Parameters: {params['best_params']}")
         
-        print(f"\n6. ALGORITHMIC IMPROVEMENTS:")
-        print(f"   - Added 6 different noise detection algorithms")
-        print(f"   - Implemented hyperparameter tuning for optimal performance")
+        print(f"\n8. ALGORITHMIC IMPROVEMENTS:")
+        print(f"   - Implemented 6 different noise detection algorithms")
+        print(f"   - Added hyperparameter tuning for optimal performance")
         print(f"   - Used multiple scalers (Standard, Robust, MinMax)")
-        print(f"   - Weighted ensemble based on individual performance")
-        print(f"   - Advanced performance metrics and comparison")
+        print(f"   - Implemented weighted ensemble based on individual performance")
+        print(f"   - Added voting ensemble methods (majority and weighted)")
+        print(f"   - Comprehensive performance metrics and comparison for ALL methods")
         
-        print(f"\n7. RECOMMENDATIONS:")
-        best_accuracy = max(detection_accuracies.values())
+        print(f"\n9. RECOMMENDATIONS:")
+        best_accuracy = max(detection_accuracies.values()) if detection_accuracies else 0
         print(f"   - Best detection accuracy achieved: {best_accuracy:.3f}")
         
-        if best_metrics['precision'] > 0.8:
-            print(f"   - High precision ({best_metrics['precision']:.3f}): Excellent false positive control")
-        elif best_metrics['precision'] < 0.6:
-            print(f"   - Low precision ({best_metrics['precision']:.3f}): Consider stricter thresholds")
+        if best_method in all_metrics:
+            best_metrics = all_metrics[best_method]
+            if best_metrics['precision'] > 0.8:
+                print(f"   - High precision ({best_metrics['precision']:.3f}): Excellent false positive control")
+            elif best_metrics['precision'] < 0.6:
+                print(f"   - Low precision ({best_metrics['precision']:.3f}): Consider stricter thresholds")
+            
+            if best_metrics['recall'] > 0.8:
+                print(f"   - High recall ({best_metrics['recall']:.3f}): Successfully captures most noise")
+            elif best_metrics['recall'] < 0.6:
+                print(f"   - Moderate recall ({best_metrics['recall']:.3f}): Conservative noise removal approach")
+            
+            if best_metrics['f1_score'] > 0.7:
+                print(f"   - Excellent F1-Score ({best_metrics['f1_score']:.3f}): Well-balanced performance")
+            elif best_metrics['f1_score'] > 0.5:
+                print(f"   - Good F1-Score ({best_metrics['f1_score']:.3f}): Reasonable trade-off")
+            else:
+                print(f"   - F1-Score ({best_metrics['f1_score']:.3f}): Consider alternative approaches")
         
-        if best_metrics['recall'] > 0.8:
-            print(f"   - High recall ({best_metrics['recall']:.3f}): Successfully captures most noise")
-        elif best_metrics['recall'] < 0.6:
-            print(f"   - Moderate recall ({best_metrics['recall']:.3f}): Conservative noise removal approach")
-        
-        if best_metrics['f1_score'] > 0.7:
-            print(f"   - Excellent F1-Score ({best_metrics['f1_score']:.3f}): Well-balanced performance")
-        elif best_metrics['f1_score'] > 0.5:
-            print(f"   - Good F1-Score ({best_metrics['f1_score']:.3f}): Reasonable trade-off")
-        else:
-            print(f"   - Low F1-Score ({best_metrics['f1_score']:.3f}): Consider alternative approaches")
-        
-        print(f"\n8. OUTPUT FILES GENERATED:")
-        print(f"   - advanced_denoised_data.csv: Final denoised dataset")
-        print(f"   - parameter_distributions.png: Original parameter distributions")
-        print(f"   - correlation_matrix.png: Parameter correlation analysis")
-        print(f"   - noise_detection_results.png: Noise detection visualization")
-        print(f"   - advanced_denoising_comparison.png: Advanced before/after comparison")
+        print(f"\n10. OUTPUT FILES GENERATED:")
+        print(f"    - advanced_denoised_data.csv: Final denoised dataset")
+        print(f"    - parameter_distributions.png: Original parameter distributions")
+        print(f"    - correlation_matrix.png: Parameter correlation analysis")
+        print(f"    - advanced_noise_detection_results.png: Noise detection visualization")
+        print(f"    - advanced_denoising_comparison.png: Advanced before/after comparison")
         
         print(f"\n" + "="*80)
 
