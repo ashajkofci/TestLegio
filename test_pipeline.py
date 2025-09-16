@@ -17,9 +17,17 @@ def test_fcs_parser():
     print("Testing FCS Parser...")
     
     try:
-        # Test loading both files
-        full_data = load_fcs_data('full_measurement.fcs')
-        noise_data = load_fcs_data('only_noise.fcs')
+        # Test loading both files from new or old structure
+        import os
+        if os.path.exists('data/normal_files/full_measurement.fcs'):
+            full_data = load_fcs_data('data/normal_files/full_measurement.fcs')
+        else:
+            full_data = load_fcs_data('full_measurement.fcs')
+            
+        if os.path.exists('data/noise_files/only_noise.fcs'):
+            noise_data = load_fcs_data('data/noise_files/only_noise.fcs')
+        else:
+            noise_data = load_fcs_data('only_noise.fcs')
         
         # Validate basic structure
         assert len(full_data) == 32875, f"Expected 32875 events, got {len(full_data)}"
@@ -55,7 +63,7 @@ def test_pipeline_initialization():
     
     try:
         pipeline = FlowCytometryPipeline()
-        pipeline.load_data('full_measurement.fcs', 'only_noise.fcs')
+        pipeline.load_data()  # Use default directory structure
         
         # Check combined data
         assert pipeline.combined_data is not None, "Combined data is None"
@@ -63,10 +71,10 @@ def test_pipeline_initialization():
         assert 'source' in pipeline.combined_data.columns, "Source column missing"
         assert 'original_index' in pipeline.combined_data.columns, "Original index column missing"
         
-        # Check source distribution
+        # Check source distribution - CORRECTED labels
         source_counts = pipeline.combined_data['source'].value_counts()
-        assert source_counts['full_measurement'] == 32875, f"Wrong full measurement count: {source_counts['full_measurement']}"
-        assert source_counts['noise_only'] == 41350, f"Wrong noise count: {source_counts['noise_only']}"
+        assert source_counts['normal'] == 32875, f"Wrong normal count: {source_counts['normal']}"
+        assert source_counts['noise'] == 41350, f"Wrong noise count: {source_counts['noise']}"
         
         print("✓ Pipeline initialization tests passed")
         return True
@@ -83,7 +91,7 @@ def test_fl1_filtering():
     
     try:
         pipeline = FlowCytometryPipeline()
-        pipeline.load_data('full_measurement.fcs', 'only_noise.fcs')
+        pipeline.load_data()  # Use default directory structure
         pipeline.apply_fl1_threshold()
         
         # Check filtering results
@@ -111,7 +119,7 @@ def test_noise_detection():
     
     try:
         pipeline = FlowCytometryPipeline()
-        pipeline.load_data('full_measurement.fcs', 'only_noise.fcs')
+        pipeline.load_data()  # Use default directory structure
         pipeline.apply_fl1_threshold()
         
         # Run noise detection

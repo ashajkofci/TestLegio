@@ -28,6 +28,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from fcs_parser import load_fcs_data
+from bayesian_denoising import BayesianTemporalDenoiser
 
 
 class FlowCytometryPipeline:
@@ -42,22 +43,64 @@ class FlowCytometryPipeline:
         self.fl1_threshold = 2e4  # 2×10⁴
         self.best_params = {}  # Store best parameters for each method
         
-    def load_data(self, full_measurement_path: str, noise_path: str):
-        """Load both FCS files and prepare data with source labels."""
+    def load_data(self, normal_files_dir='data/normal_files', noise_files_dir='data/noise_files'):
+        """Load both FCS files and prepare data with CORRECTED source labels."""
         print("Loading FCS files...")
         
-        # Load the data
-        self.full_data = load_fcs_data(full_measurement_path)
-        self.noise_data = load_fcs_data(noise_path)
+        from bayesian_denoising import load_multiple_files
+        import os
         
-        print(f"Full measurement data: {self.full_data.shape}")
+        # Initialize to None
+        self.full_data = None
+        self.noise_data = None
+        
+        # CORRECTED: Load normal data (was previously called 'full_measurement')
+        if os.path.exists(normal_files_dir):
+            normal_datasets = load_multiple_files(normal_files_dir)
+            if normal_datasets:
+                self.full_data = pd.concat(normal_datasets, ignore_index=True)
+            else:
+                # Fallback - load single file
+                normal_files = [f for f in os.listdir(normal_files_dir) if f.endswith('.fcs')]
+                if normal_files:
+                    self.full_data = load_fcs_data(os.path.join(normal_files_dir, normal_files[0]))
+        
+        # Fallback for backward compatibility if no data loaded
+        if self.full_data is None:
+            try:
+                self.full_data = load_fcs_data('full_measurement.fcs')
+            except:
+                print("Error: Could not load normal data from any source")
+                return None
+        
+        # CORRECTED: Load noise data (was previously called 'noise_only')  
+        if os.path.exists(noise_files_dir):
+            noise_datasets = load_multiple_files(noise_files_dir)
+            if noise_datasets:
+                self.noise_data = pd.concat(noise_datasets, ignore_index=True)
+            else:
+                # Fallback - load single file
+                noise_files = [f for f in os.listdir(noise_files_dir) if f.endswith('.fcs')]
+                if noise_files:
+                    self.noise_data = load_fcs_data(os.path.join(noise_files_dir, noise_files[0]))
+        
+        # Fallback for backward compatibility if no data loaded
+        if self.noise_data is None:
+            try:
+                self.noise_data = load_fcs_data('only_noise.fcs')
+            except:
+                print("Error: Could not load noise data from any source")
+                return None
+        
+        print(f"Normal data: {self.full_data.shape}")
         print(f"Noise data: {self.noise_data.shape}")
         
-        # Add source labels and original indices
-        self.full_data['source'] = 'full_measurement'
+        # CORRECTED: Proper source labels based on user clarification
+        # only_noise.fcs = NOISE data, full_measurement.fcs = NORMAL data
+        self.full_data['source'] = 'normal'  # This contains normal measurements
         self.full_data['original_index'] = range(len(self.full_data))
         
-        self.noise_data['source'] = 'noise_only'
+        self.noise_data['source'] = 'noise'  # This contains noise data
         self.noise_data['original_index'] = range(len(self.noise_data))
         
         # Combine datasets while retaining indices
@@ -269,12 +312,12 @@ class FlowCytometryPipeline:
             'minmax': MinMaxScaler()
         }
         
-        # True labels - CORRECTED: full_measurement.fcs contains the noise data
-        # Based on user clarification: only_noise.fcs has very few points >2e4 (normal data)
-        # full_measurement.fcs has many points >2e4 (noise data)
-        y_true = (self.filtered_data['source'] == 'full_measurement').astype(int)
+        # True labels - CORRECTED INTERPRETATION:
+        # noise data comes from 'noise' source (only_noise.fcs)
+        # normal data comes from 'normal' source (full_measurement.fcs)
+        y_true = (self.filtered_data['source'] == 'noise').astype(int)
         print(f"True noise samples: {y_true.sum()} / {len(y_true)} ({100 * y_true.mean():.1f}%)")
-        print(f"Data interpretation: full_measurement.fcs = noise, only_noise.fcs = normal")
+        print(f"CORRECTED interpretation: noise source = 'noise', normal source = 'normal'")
         
         # Test different scalers and find best one
         best_scaler_name = 'standard'
@@ -415,7 +458,7 @@ class FlowCytometryPipeline:
         else:
             y_pred_ee_binary = np.zeros(len(y_true))
         
-        # 6. Gaussian Mixture Model
+        # 6. Gaussian Mixture Model:
         print("\n6. Gaussian Mixture Model:")
         n_components_list = [2, 3, 4, 5]
         best_gmm_score = 0
@@ -453,6 +496,43 @@ class FlowCytometryPipeline:
         else:
             y_pred_gmm_binary = np.zeros(len(y_true))
         
+        # 7. Bayesian Temporal Denoiser (NEW)
+        print("\n7. Bayesian Temporal Methods:")
+        
+        try:
+            # Initialize Bayesian denoiser
+            bayesian_denoiser = BayesianTemporalDenoiser(time_window=1000)
+            
+            # Prepare data for Bayesian analysis
+            feature_cols = ['TIME', 'SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
+            bayesian_data = self.filtered_data[feature_cols + ['source']].copy()
+            
+            # Bayesian Gaussian Mixture with Temporal Features
+            bgm_predictions, bgm_info = bayesian_denoiser.bayesian_gaussian_mixture_temporal(bayesian_data)
+            bgm_accuracy = accuracy_score(y_true, bgm_predictions)
+            
+            print(f"   Bayesian Gaussian Mixture: {bgm_accuracy:.3f}")
+            detection_results['bayesian_gmm_temporal'] = bgm_accuracy
+            
+            # Temporal Co-occurrence Analysis  
+            cooccur_predictions, cooccur_info = bayesian_denoiser.temporal_co_occurrence_analysis(bayesian_data)
+            cooccur_accuracy = accuracy_score(y_true, cooccur_predictions)
+            
+            print(f"   Temporal Co-occurrence: {cooccur_accuracy:.3f}")
+            detection_results['temporal_cooccurrence'] = cooccur_accuracy
+            
+            # Store Bayesian predictions
+            self.filtered_data['bayesian_gmm_temporal'] = bgm_predictions
+            self.filtered_data['temporal_cooccurrence'] = cooccur_predictions
+            
+        except Exception as e:
+            print(f"   Bayesian methods failed: {e}")
+            # Use zeros as fallback
+            bgm_predictions = np.zeros(len(y_true))
+            cooccur_predictions = np.zeros(len(y_true))
+            self.filtered_data['bayesian_gmm_temporal'] = bgm_predictions
+            self.filtered_data['temporal_cooccurrence'] = cooccur_predictions
+        
         # Store all predictions
         self.filtered_data['iso_forest_tuned'] = y_pred_iso_binary
         self.filtered_data['lof_tuned'] = y_pred_lof_binary
@@ -461,20 +541,32 @@ class FlowCytometryPipeline:
         self.filtered_data['elliptic_envelope'] = y_pred_ee_binary
         self.filtered_data['gaussian_mixture'] = y_pred_gmm_binary
         
-        # Advanced ensemble (weighted by performance)
-        predictions = np.array([
+        # Advanced ensemble (weighted by performance) - including Bayesian methods
+        all_predictions = [
             y_pred_iso_binary, y_pred_lof_binary, y_pred_dbscan,
             y_pred_svm_binary, y_pred_ee_binary, y_pred_gmm_binary
-        ])
+        ]
         
-        weights = np.array([
+        all_accuracies = [
             detection_results.get('isolation_forest_tuned', 0),
             detection_results.get('local_outlier_factor_tuned', 0),
             detection_results.get('dbscan_tuned', 0),
             detection_results.get('one_class_svm', 0),
             detection_results.get('elliptic_envelope', 0),
             detection_results.get('gaussian_mixture', 0)
-        ])
+        ]
+        
+        # Add Bayesian methods if available
+        if 'bayesian_gmm_temporal' in self.filtered_data.columns:
+            all_predictions.append(self.filtered_data['bayesian_gmm_temporal'].values)
+            all_accuracies.append(detection_results.get('bayesian_gmm_temporal', 0))
+            
+        if 'temporal_cooccurrence' in self.filtered_data.columns:
+            all_predictions.append(self.filtered_data['temporal_cooccurrence'].values)
+            all_accuracies.append(detection_results.get('temporal_cooccurrence', 0))
+        
+        predictions_array = np.array(all_predictions)
+        weights = np.array(all_accuracies)
         
         # Normalize weights
         if weights.sum() > 0:
@@ -483,16 +575,22 @@ class FlowCytometryPipeline:
             weights = np.ones(len(weights)) / len(weights)
         
         # Weighted ensemble
-        ensemble_scores = np.average(predictions, weights=weights, axis=0)
+        ensemble_scores = np.average(predictions_array, weights=weights, axis=0)
         ensemble_pred = (ensemble_scores > 0.5).astype(int)
         ensemble_accuracy = accuracy_score(y_true, ensemble_pred)
         
         self.filtered_data['ensemble_advanced'] = ensemble_pred
         detection_results['ensemble_advanced'] = ensemble_accuracy
         
-        print(f"\n7. Advanced Weighted Ensemble:")
+        method_names = ['ISO', 'LOF', 'DBSCAN', 'SVM', 'EE', 'GMM']
+        if 'bayesian_gmm_temporal' in self.filtered_data.columns:
+            method_names.append('BGM')
+        if 'temporal_cooccurrence' in self.filtered_data.columns:
+            method_names.append('TCO')
+        
+        print(f"\n8. Advanced Weighted Ensemble (with Bayesian methods):")
         print(f"   Accuracy: {ensemble_accuracy:.3f}")
-        print(f"   Weights: {dict(zip(['ISO', 'LOF', 'DBSCAN', 'SVM', 'EE', 'GMM'], weights))}")
+        print(f"   Weights: {dict(zip(method_names, weights))}")
         
         return detection_results
     
@@ -566,7 +664,7 @@ class FlowCytometryPipeline:
         detection_cols = [col for col in self.filtered_data.columns if col.endswith('_tuned') or col in ['one_class_svm', 'elliptic_envelope', 'gaussian_mixture', 'ensemble_advanced']]
         
         # Calculate comprehensive metrics for ALL methods
-        true_noise_mask = self.filtered_data['source'] == 'full_measurement'  # full_measurement.fcs contains noise data
+        true_noise_mask = self.filtered_data['source'] == 'noise'  # CORRECTED: noise comes from 'noise' source
         
         all_metrics = {}
         print(f"\nComprehensive Performance Metrics for ALL Methods:")
@@ -849,12 +947,12 @@ class FlowCytometryPipeline:
 
 
 def main():
-    """Main pipeline execution with advanced methods."""
+    """Main pipeline execution with advanced methods and corrected file interpretation."""
     # Initialize pipeline
     pipeline = FlowCytometryPipeline()
     
-    # Load data
-    pipeline.load_data('full_measurement.fcs', 'only_noise.fcs')
+    # Load data from organized directory structure
+    pipeline.load_data()  # Uses default paths: data/normal_files and data/noise_files
     
     # Apply FL1 threshold
     pipeline.apply_fl1_threshold()
@@ -862,7 +960,7 @@ def main():
     # Explore data characteristics
     pipeline.explore_data()
     
-    # Detect noise patterns with advanced methods
+    # Detect noise patterns with advanced methods (including Bayesian)
     detection_accuracies = pipeline.detect_noise_patterns_advanced()
     
     # Visualize detection results
@@ -888,33 +986,41 @@ def test_noise_only_denoising():
     print("="*80)
     
     from fcs_parser import load_fcs_data
+    import os
     
-    # Load the files - based on FL1 characteristics, full_measurement.fcs contains mostly noise
-    full_data = load_fcs_data('full_measurement.fcs')  # This contains the noise data
-    only_data = load_fcs_data('only_noise.fcs')  # This contains the normal data
+    # Load the files with CORRECTED interpretation
+    if os.path.exists('data/normal_files/full_measurement.fcs'):
+        normal_data = load_fcs_data('data/normal_files/full_measurement.fcs')  # Normal data
+    else:
+        normal_data = load_fcs_data('full_measurement.fcs')
+        
+    if os.path.exists('data/noise_files/only_noise.fcs'):
+        noise_data = load_fcs_data('data/noise_files/only_noise.fcs')  # Noise data
+    else:
+        noise_data = load_fcs_data('only_noise.fcs')
     
-    print(f"Analyzing files:")
-    print(f"  full_measurement.fcs: {len(full_data)} events")
-    print(f"    - FL1 > 2e4: {(full_data['FL1'] > 2e4).sum()} events")
-    print(f"  only_noise.fcs: {len(only_data)} events")
-    print(f"    - FL1 > 2e4: {(only_data['FL1'] > 2e4).sum()} events")
+    print(f"Analyzing files with CORRECTED interpretation:")
+    print(f"  Normal data (full_measurement.fcs): {len(normal_data)} events")
+    print(f"    - FL1 > 2e4: {(normal_data['FL1'] > 2e4).sum()} events")
+    print(f"  Noise data (only_noise.fcs): {len(noise_data)} events")
+    print(f"    - FL1 > 2e4: {(noise_data['FL1'] > 2e4).sum()} events")
     
-    # Test 1: Noise data only (from full_measurement.fcs filtered by FL1 > 2e4)
-    noise_data = full_data[full_data['FL1'] > 2e4].copy()
-    noise_data['source'] = 'noise_only'
-    noise_data['original_index'] = range(len(noise_data))
+    # Test 1: Noise data only (from only_noise.fcs filtered by FL1 > 2e4)
+    pure_noise_data = noise_data[noise_data['FL1'] > 2e4].copy()
+    pure_noise_data['source'] = 'noise'
+    pure_noise_data['original_index'] = range(len(pure_noise_data))
     
     print(f"\n=== TEST 1: PURE NOISE DENOISING ===")
-    print(f"Testing on {len(noise_data)} pure noise events (FL1 > 2e4)")
+    print(f"Testing on {len(pure_noise_data)} pure noise events (FL1 > 2e4)")
     
     # Initialize pipeline for noise-only test
     pipeline_noise = FlowCytometryPipeline()
-    pipeline_noise.filtered_data = noise_data
+    pipeline_noise.filtered_data = pure_noise_data
     
     # Since all data is noise, we need to create artificial ground truth
     # We'll use the assumption that very high FL1 values are more likely to be noise
     feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
-    X_noise = noise_data[feature_cols].values
+    X_noise = pure_noise_data[feature_cols].values
     
     # Standardize features
     scaler = StandardScaler()
@@ -922,8 +1028,8 @@ def test_noise_only_denoising():
     
     # Create artificial labels based on extreme values (top 20% as "pure noise")
     fl1_threshold_percentile = 80
-    high_noise_threshold = np.percentile(noise_data['FL1'], fl1_threshold_percentile)
-    artificial_noise_labels = (noise_data['FL1'] > high_noise_threshold).astype(int)
+    high_noise_threshold = np.percentile(pure_noise_data['FL1'], fl1_threshold_percentile)
+    artificial_noise_labels = (pure_noise_data['FL1'] > high_noise_threshold).astype(int)
     
     print(f"Creating artificial ground truth:")
     print(f"  - High noise threshold (top 20%): FL1 > {high_noise_threshold:.0f}")
@@ -1025,10 +1131,10 @@ def test_noise_only_denoising():
         unique_clusters = np.unique(cluster_labels[cluster_labels != -1])
         outliers = (cluster_labels == -1).sum()
         
-        print(f"DBSCAN Results on {len(noise_data)} noise events:")
+        print(f"DBSCAN Results on {len(pure_noise_data)} noise events:")
         print(f"  - Number of clusters found: {len(unique_clusters)}")
-        print(f"  - Outliers detected: {outliers} ({100*outliers/len(noise_data):.1f}%)")
-        print(f"  - Events kept as 'clean': {len(noise_data) - outliers} ({100*(len(noise_data)-outliers)/len(noise_data):.1f}%)")
+        print(f"  - Outliers detected: {outliers} ({100*outliers/len(pure_noise_data):.1f}%)")
+        print(f"  - Events kept as 'clean': {len(pure_noise_data) - outliers} ({100*(len(pure_noise_data)-outliers)/len(pure_noise_data):.1f}%)")
         
         # Statistical analysis of removed vs kept noise
         kept_mask = cluster_labels != -1
@@ -1040,8 +1146,8 @@ def test_noise_only_denoising():
             print("-" * 50)
             
             for param in feature_cols:
-                kept_mean = noise_data[kept_mask][param].mean()
-                removed_mean = noise_data[removed_mask][param].mean()
+                kept_mean = pure_noise_data[kept_mask][param].mean()
+                removed_mean = pure_noise_data[removed_mask][param].mean()
                 diff_percent = (removed_mean - kept_mean) / kept_mean * 100
                 
                 print(f"{param:<10} {kept_mean:<12.1f} {removed_mean:<14.1f} {diff_percent:<12.1f}%")
@@ -1049,15 +1155,15 @@ def test_noise_only_denoising():
     # Test 3: Cross-validation test
     print(f"\n=== CROSS-VALIDATION WITH NORMAL DATA ===")
     
-    # Use normal data (from only_noise.fcs) as clean reference
-    normal_data_filtered = only_data[only_data['FL1'] > 2e4].copy()
+    # Use normal data (from full_measurement.fcs) as clean reference
+    normal_data_filtered = normal_data[normal_data['FL1'] > 2e4].copy()
     
     if len(normal_data_filtered) > 0:
         print(f"Testing with {len(normal_data_filtered)} normal events (FL1 > 2e4) as 'clean' reference")
         
         # Combine noise and normal data for testing
         test_combined = pd.concat([
-            noise_data.assign(true_label=1),  # 1 = noise
+            pure_noise_data.assign(true_label=1),  # 1 = noise
             normal_data_filtered.assign(true_label=0)  # 0 = normal
         ], ignore_index=True)
         
@@ -1085,7 +1191,7 @@ def test_noise_only_denoising():
         print("No normal events with FL1 > 2e4 found for cross-validation")
     
     return {
-        'noise_events_analyzed': len(noise_data),
+        'noise_events_analyzed': len(pure_noise_data),
         'best_dbscan_score': best_dbscan_score,
         'best_iso_score': best_iso_score, 
         'best_lof_score': best_lof_score,
