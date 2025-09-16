@@ -257,7 +257,8 @@ class OptimizedFlowCytometryPipeline:
             'bayesian_ridge',
             'dirichlet_process',
             'change_point_detection',
-            'ensemble_bayesian'
+            'ensemble_bayesian',
+            'bayesian_network'
         ]
         
         for method in bayesian_methods:
@@ -362,10 +363,13 @@ class OptimizedFlowCytometryPipeline:
                             print(f"    {alg_name:20}: Failed - {e}")
                             file_results['algorithms'][alg_name] = self._get_default_metrics()
                 
-                # Test ensemble methods
+                # Compute all predictions once for ensemble methods (optimization)
+                predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
+                
+                # Test ensemble methods using cached predictions
                 for ensemble_name, ensemble_func in self.ensemble_methods.items():
                     try:
-                        y_pred = ensemble_func(X_test, X_test_scaled)
+                        y_pred = ensemble_func(X_test, X_test_scaled, predictions_cache)
                         results = self._calculate_metrics(y_true, y_pred)
                         file_results['algorithms'][ensemble_name] = results
                         print(f"    {ensemble_name:20}: Acc={results['accuracy']:.3f}, F1={results['f1_score']:.3f}, "
@@ -405,6 +409,45 @@ class OptimizedFlowCytometryPipeline:
         
         return self._calculate_metrics(y_true, y_pred)
     
+    def _compute_all_predictions(self, X_test, X_test_scaled):
+        """Compute predictions for all algorithms once and cache them."""
+        predictions_cache = {}
+        
+        for alg_name, model in self.trained_models.items():
+            if self.training_times.get(alg_name, 0) == 0:  # Skip failed models
+                continue
+                
+            try:
+                if alg_name == 'dbscan':
+                    labels = model.fit_predict(X_test_scaled)
+                    predictions_cache[alg_name] = (labels == -1).astype(int)
+                elif alg_name == 'gaussian_mixture':
+                    labels = model.fit_predict(X_test_scaled)
+                    unique_labels, counts = np.unique(labels, return_counts=True)
+                    noise_cluster = unique_labels[np.argmin(counts)]
+                    predictions_cache[alg_name] = (labels == noise_cluster).astype(int)
+                elif alg_name == 'bayesian_temporal':
+                    feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
+                    X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
+                    if 'TIME' not in X_df.columns:
+                        X_df['TIME'] = np.arange(len(X_test))
+                    predictions_cache[alg_name] = model.predict(X_df)
+                elif alg_name.startswith('bayesian_'):
+                    # Handle all other Bayesian methods
+                    feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
+                    X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
+                    if 'TIME' not in X_df.columns:
+                        X_df['TIME'] = np.arange(len(X_test))
+                    predictions_cache[alg_name] = model.predict(X_df)
+                else:
+                    pred = model.predict(X_test_scaled)
+                    predictions_cache[alg_name] = (pred == -1).astype(int)
+            except Exception as e:
+                print(f"Warning: Failed to compute predictions for {alg_name}: {e}")
+                continue
+        
+        return predictions_cache
+    
     def _calculate_metrics(self, y_true, y_pred):
         """Calculate comprehensive metrics."""
         cm = confusion_matrix(y_true, y_pred)
@@ -425,44 +468,25 @@ class OptimizedFlowCytometryPipeline:
             'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0
         }
     
-    def _majority_voting(self, X_test, X_test_scaled):
+    def _majority_voting(self, X_test, X_test_scaled, predictions_cache=None):
         """Majority voting ensemble using pre-trained models."""
-        predictions = []
+        if predictions_cache is None:
+            predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
         
-        for alg_name, model in self.trained_models.items():
-            if self.training_times.get(alg_name, 0) == 0:  # Skip failed models
-                continue
-                
-            try:
-                if alg_name == 'dbscan':
-                    labels = model.fit_predict(X_test_scaled)
-                    pred = (labels == -1).astype(int)
-                elif alg_name == 'gaussian_mixture':
-                    labels = model.fit_predict(X_test_scaled)
-                    unique_labels, counts = np.unique(labels, return_counts=True)
-                    noise_cluster = unique_labels[np.argmin(counts)]
-                    pred = (labels == noise_cluster).astype(int)
-                elif alg_name == 'bayesian_temporal':
-                    feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
-                    X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
-                    if 'TIME' not in X_df.columns:
-                        X_df['TIME'] = np.arange(len(X_test))
-                    pred = model.predict(X_df)
-                else:
-                    pred = model.predict(X_test_scaled)
-                    pred = (pred == -1).astype(int)
-                
-                predictions.append(pred)
-            except:
-                continue
+        predictions = []
+        for alg_name in predictions_cache:
+            predictions.append(predictions_cache[alg_name])
         
         if len(predictions) > 0:
             return (np.mean(predictions, axis=0) > 0.5).astype(int)
         else:
             return np.zeros(len(X_test), dtype=int)
     
-    def _weighted_voting(self, X_test, X_test_scaled):
+    def _weighted_voting(self, X_test, X_test_scaled, predictions_cache=None):
         """Weighted voting ensemble based on training performance."""
+        if predictions_cache is None:
+            predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
+        
         predictions = []
         weights = []
         
@@ -479,36 +503,13 @@ class OptimizedFlowCytometryPipeline:
             'bayesian_bayesian_ridge': 1.2,
             'bayesian_dirichlet_process': 1.5,
             'bayesian_change_point_detection': 1.1,
-            'bayesian_ensemble_bayesian': 1.6  # Highest weight for ensemble
+            'bayesian_ensemble_bayesian': 1.6,  # Highest weight for ensemble
+            'bayesian_bayesian_network': 1.4
         }
         
-        for alg_name, model in self.trained_models.items():
-            if self.training_times.get(alg_name, 0) == 0:
-                continue
-                
-            try:
-                if alg_name == 'dbscan':
-                    labels = model.fit_predict(X_test_scaled)
-                    pred = (labels == -1).astype(int)
-                elif alg_name == 'gaussian_mixture':
-                    labels = model.fit_predict(X_test_scaled)
-                    unique_labels, counts = np.unique(labels, return_counts=True)
-                    noise_cluster = unique_labels[np.argmin(counts)]
-                    pred = (labels == noise_cluster).astype(int)
-                elif alg_name == 'bayesian_temporal':
-                    feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
-                    X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
-                    if 'TIME' not in X_df.columns:
-                        X_df['TIME'] = np.arange(len(X_test))
-                    pred = model.predict(X_df)
-                else:
-                    pred = model.predict(X_test_scaled)
-                    pred = (pred == -1).astype(int)
-                
-                predictions.append(pred)
-                weights.append(algorithm_weights.get(alg_name, 1.0))
-            except:
-                continue
+        for alg_name in predictions_cache:
+            predictions.append(predictions_cache[alg_name])
+            weights.append(algorithm_weights.get(alg_name, 1.0))
         
         if len(predictions) > 0:
             weighted_predictions = np.average(predictions, axis=0, weights=weights)
@@ -516,36 +517,14 @@ class OptimizedFlowCytometryPipeline:
         else:
             return np.zeros(len(X_test), dtype=int)
     
-    def _conservative_ensemble(self, X_test, X_test_scaled):
+    def _conservative_ensemble(self, X_test, X_test_scaled, predictions_cache=None):
         """Conservative ensemble requiring multiple algorithms to agree."""
-        predictions = []
+        if predictions_cache is None:
+            predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
         
-        for alg_name, model in self.trained_models.items():
-            if self.training_times.get(alg_name, 0) == 0:
-                continue
-                
-            try:
-                if alg_name == 'dbscan':
-                    labels = model.fit_predict(X_test_scaled)
-                    pred = (labels == -1).astype(int)
-                elif alg_name == 'gaussian_mixture':
-                    labels = model.fit_predict(X_test_scaled)
-                    unique_labels, counts = np.unique(labels, return_counts=True)
-                    noise_cluster = unique_labels[np.argmin(counts)]
-                    pred = (labels == noise_cluster).astype(int)
-                elif alg_name.startswith('bayesian_'):
-                    feature_names = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
-                    X_df = pd.DataFrame(X_test, columns=feature_names[:X_test.shape[1]])
-                    if 'TIME' not in X_df.columns:
-                        X_df['TIME'] = np.arange(len(X_test))
-                    pred = model.predict(X_df)
-                else:
-                    pred = model.predict(X_test_scaled)
-                    pred = (pred == -1).astype(int)
-                
-                predictions.append(pred)
-            except:
-                continue
+        predictions = []
+        for alg_name in predictions_cache:
+            predictions.append(predictions_cache[alg_name])
         
         if len(predictions) > 0:
             # Require at least 2/3 of algorithms to agree on noise classification
@@ -647,6 +626,18 @@ class OptimizedFlowCytometryPipeline:
         combined_data = pd.concat([normal_data, noise_data], ignore_index=True)
         combined_data['true_label'] = [0] * len(normal_data) + [1] * len(noise_data)
         
+        # Prepare data for all algorithms
+        feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
+        if 'TIME' in combined_data.columns:
+            feature_cols.append('TIME')
+        
+        X_test = combined_data[feature_cols].fillna(0).values
+        y_true = combined_data['true_label'].values
+        X_test_scaled = self.fitted_scaler.transform(X_test)
+        
+        # Compute all predictions once for visualization (optimization)
+        predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
+        
         # Create comprehensive visualization
         n_algorithms = len(last_result['algorithms'])
         n_cols = min(4, n_algorithms)
@@ -658,21 +649,18 @@ class OptimizedFlowCytometryPipeline:
             ax = plt.subplot(n_rows, n_cols, idx + 1)
             
             try:
-                # Get predictions for this algorithm
-                feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
-                if 'TIME' in combined_data.columns:
-                    feature_cols.append('TIME')
-                
-                X_test = combined_data[feature_cols].fillna(0).values
-                y_true = combined_data['true_label'].values
-                X_test_scaled = self.fitted_scaler.transform(X_test)
-                
+                # Get predictions for this algorithm from cache
                 if alg_name in self.trained_models and self.training_times.get(alg_name, 0) > 0:
-                    model = self.trained_models[alg_name]
-                    y_pred = self._get_predictions_for_visualization(model, X_test, X_test_scaled, alg_name)
+                    y_pred = predictions_cache.get(alg_name)
+                    if y_pred is None:
+                        ax.text(0.5, 0.5, f'Error: No predictions for {alg_name}', transform=ax.transAxes, ha='center')
+                        ax.set_title(f'{alg_name} - Error')
+                        continue
                 elif alg_name in self.ensemble_methods:
-                    y_pred = self.ensemble_methods[alg_name](X_test, X_test_scaled)
+                    y_pred = self.ensemble_methods[alg_name](X_test, X_test_scaled, predictions_cache)
                 else:
+                    ax.text(0.5, 0.5, f'Error: Unknown algorithm {alg_name}', transform=ax.transAxes, ha='center')
+                    ax.set_title(f'{alg_name} - Error')
                     continue
                 
                 # Create classification for visualization
@@ -706,7 +694,8 @@ class OptimizedFlowCytometryPipeline:
         
         plt.tight_layout()
         plt.savefig('optimized_algorithm_visualizations.png', dpi=300, bbox_inches='tight')
-        plt.show()
+        print("Visualization saved to 'optimized_algorithm_visualizations.png'")
+        plt.close()  # Close the figure to free memory
         
         # Create performance comparison
         self._create_performance_comparison()
@@ -764,7 +753,8 @@ class OptimizedFlowCytometryPipeline:
         plt.tight_layout()
         
         plt.savefig('optimized_performance_comparison.png', dpi=300, bbox_inches='tight')
-        plt.show()
+        print("Performance comparison saved to 'optimized_performance_comparison.png'")
+        plt.close()  # Close the figure to free memory
     
     def save_models(self, directory='trained_models'):
         """Save trained models."""
