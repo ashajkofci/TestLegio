@@ -619,9 +619,9 @@ class FlowCytometryPipeline:
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 12))
         fig.suptitle('Advanced Noise Detection Results (PCA Visualization)', fontsize=16)
         
-        # True labels
+        # True labels - CORRECTED mapping
         axes[0, 0].scatter(X_pca[:, 0], X_pca[:, 1], 
-                          c=self.filtered_data['source'].map({'full_measurement': 0, 'noise_only': 1}),
+                          c=self.filtered_data['source'].map({'normal': 0, 'noise': 1}),
                           cmap='coolwarm', alpha=0.6, s=20)
         axes[0, 0].set_title('True Labels')
         axes[0, 0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
@@ -640,9 +640,9 @@ class FlowCytometryPipeline:
                 axes[row, col_idx].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
                 axes[row, col_idx].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
         
-        # FL1 vs FL2 scatter plot with true labels
+        # FL1 vs FL2 scatter plot with true labels - CORRECTED mapping
         axes[1, 2].scatter(self.filtered_data['FL1'], self.filtered_data['FL2'],
-                          c=self.filtered_data['source'].map({'full_measurement': 0, 'noise_only': 1}),
+                          c=self.filtered_data['source'].map({'normal': 0, 'noise': 1}),
                           cmap='coolwarm', alpha=0.6, s=20)
         axes[1, 2].set_title('FL1 vs FL2 (True Labels)')
         axes[1, 2].set_xlabel('FL1')

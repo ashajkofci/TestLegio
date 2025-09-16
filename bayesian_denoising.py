@@ -72,12 +72,13 @@ class BayesianTemporalDenoiser:
         
         # Time-binned statistics
         features['time_bin'] = pd.cut(features['TIME'], bins=100, labels=False)
+        features['time_bin'] = features['time_bin'].fillna(0).astype(int)  # Handle NaN values
         bin_stats = features.groupby('time_bin')[['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']].agg(['mean', 'std']).fillna(0)
         bin_stats.columns = ['_'.join(col).strip() for col in bin_stats.columns]
         
         # Map bin statistics back to events
         for col in bin_stats.columns:
-            features[f'bin_{col}'] = features['time_bin'].map(bin_stats[col])
+            features[f'bin_{col}'] = features['time_bin'].map(bin_stats[col]).fillna(0)
         
         return features
     
@@ -102,9 +103,9 @@ class BayesianTemporalDenoiser:
         
         for i, t in enumerate(times):
             # Find distance to nearest neighbors
-            distances = np.abs(times - t)
+            distances = np.abs(times - t).astype(float)  # Ensure float type
             distances[i] = np.inf  # Exclude self
-            min_distance = np.min(distances)
+            min_distance = np.min(distances[distances != np.inf])  # Exclude infinity
             isolation.append(min_distance)
         
         return np.array(isolation)
@@ -122,54 +123,90 @@ class BayesianTemporalDenoiser:
         """
         print("Running Bayesian Gaussian Mixture with Temporal Features...")
         
-        # Extract temporal features
-        features = self.extract_temporal_features(data)
-        
-        # Select features for modeling
-        feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 
-                       'time_normalized', 'temporal_density', 'temporal_isolation']
-        
-        # Add temporal gradient features
-        gradient_cols = [col for col in features.columns if 'gradient' in col]
-        feature_cols.extend(gradient_cols[:3])  # Add first 3 gradient features
-        
-        X = features[feature_cols].values
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Auto-select number of components if not provided
-        if n_components is None:
-            n_components = self._select_optimal_components(X_scaled, method='bgm')
-        
-        # Fit Bayesian Gaussian Mixture
-        bgm = BayesianGaussianMixture(
-            n_components=n_components,
-            covariance_type='full',
-            max_iter=200,
-            random_state=42
-        )
-        
-        cluster_labels = bgm.fit_predict(X_scaled)
-        
-        # Calculate posterior probabilities
-        log_probs = bgm.score_samples(X_scaled)
-        posterior_probs = bgm.predict_proba(X_scaled)
-        
-        # Identify noise cluster based on temporal characteristics
-        noise_cluster = self._identify_noise_cluster_temporal(features, cluster_labels, posterior_probs)
-        
-        # Generate noise predictions
-        noise_predictions = (cluster_labels == noise_cluster).astype(int)
-        
-        # Store model
-        self.models['bgm_temporal'] = bgm
-        
-        return noise_predictions, {
-            'cluster_labels': cluster_labels,
-            'log_probs': log_probs,
-            'posterior_probs': posterior_probs,
-            'noise_cluster': noise_cluster,
-            'n_components': n_components
-        }
+        try:
+            # Extract temporal features
+            features = self.extract_temporal_features(data)
+            
+            # Select features for modeling
+            feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 
+                           'time_normalized', 'temporal_density', 'temporal_isolation']
+            
+            # Add temporal gradient features (limit to avoid too many features)
+            gradient_cols = [col for col in features.columns if 'gradient' in col]
+            feature_cols.extend(gradient_cols[:3])  # Add first 3 gradient features
+            
+            # Ensure all columns exist and handle missing ones
+            available_cols = [col for col in feature_cols if col in features.columns]
+            if len(available_cols) < len(feature_cols):
+                missing_cols = set(feature_cols) - set(available_cols)
+                print(f"Warning: Missing columns {missing_cols}, using available: {available_cols}")
+                feature_cols = available_cols
+            
+            X = features[feature_cols].values
+            
+            # Check for inf/nan values
+            if np.any(~np.isfinite(X)):
+                print("Warning: Non-finite values detected, replacing with median")
+                for i in range(X.shape[1]):
+                    col_data = X[:, i]
+                    finite_mask = np.isfinite(col_data)
+                    if finite_mask.sum() > 0:
+                        median_val = np.median(col_data[finite_mask])
+                        X[~finite_mask, i] = median_val
+                    else:
+                        X[:, i] = 0  # Fallback if all values are non-finite
+            
+            X_scaled = self.scaler.fit_transform(X)
+            
+            # Auto-select number of components if not provided
+            if n_components is None:
+                n_components = self._select_optimal_components(X_scaled, method='bgm')
+            
+            # Ensure reasonable number of components
+            n_components = min(n_components, len(X) // 10, 10)
+            n_components = max(n_components, 2)
+            
+            # Fit Bayesian Gaussian Mixture
+            bgm = BayesianGaussianMixture(
+                n_components=n_components,
+                covariance_type='full',
+                max_iter=200,
+                random_state=42
+            )
+            
+            cluster_labels = bgm.fit_predict(X_scaled)
+            
+            # Calculate posterior probabilities
+            log_probs = bgm.score_samples(X_scaled)
+            posterior_probs = bgm.predict_proba(X_scaled)
+            
+            # Identify noise cluster based on temporal characteristics
+            noise_cluster = self._identify_noise_cluster_temporal(features, cluster_labels, posterior_probs)
+            
+            # Generate noise predictions
+            noise_predictions = (cluster_labels == noise_cluster).astype(int)
+            
+            # Store model
+            self.models['bgm_temporal'] = bgm
+            
+            return noise_predictions, {
+                'cluster_labels': cluster_labels,
+                'log_probs': log_probs,
+                'posterior_probs': posterior_probs,
+                'noise_cluster': noise_cluster,
+                'n_components': n_components
+            }
+            
+        except Exception as e:
+            print(f"Error in Bayesian Gaussian Mixture: {e}")
+            # Return zeros as fallback
+            return np.zeros(len(data)), {
+                'cluster_labels': np.zeros(len(data)),
+                'log_probs': np.zeros(len(data)),
+                'posterior_probs': np.zeros((len(data), 2)),
+                'noise_cluster': 0,
+                'n_components': 2
+            }
     
     def naive_bayes_temporal(self, train_data, test_data=None):
         """
@@ -231,54 +268,81 @@ class BayesianTemporalDenoiser:
         """
         print("Running Temporal Co-occurrence Analysis...")
         
-        features = self.extract_temporal_features(data)
-        
-        # Calculate co-occurrence matrices for different parameters
-        cooccurrence_scores = []
-        
-        for param in ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']:
-            # Discretize parameter values
-            param_bins = pd.cut(features[param], bins=20, labels=False)
+        try:
+            features = self.extract_temporal_features(data)
             
-            # Calculate temporal co-occurrence
-            cooccur_matrix = self._calculate_cooccurrence_matrix(
-                param_bins, features['TIME'].values
-            )
+            # Calculate co-occurrence matrices for different parameters
+            cooccurrence_scores = []
             
-            # Calculate co-occurrence scores for each event
-            scores = self._calculate_cooccurrence_scores(
-                param_bins, features['TIME'].values, cooccur_matrix
-            )
-            cooccurrence_scores.append(scores)
-        
-        # Combine co-occurrence scores
-        combined_scores = np.mean(cooccurrence_scores, axis=0)
-        
-        # Identify noise based on low co-occurrence (isolated events)
-        threshold = np.percentile(combined_scores, 20)  # Bottom 20% as potential noise
-        noise_predictions = (combined_scores < threshold).astype(int)
-        
-        return noise_predictions, {
-            'cooccurrence_scores': combined_scores,
-            'threshold': threshold,
-            'individual_scores': cooccurrence_scores
-        }
+            for param in ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']:
+                if param not in features.columns:
+                    print(f"Warning: Parameter {param} not found, skipping")
+                    continue
+                    
+                # Discretize parameter values
+                param_bins = pd.cut(features[param], bins=20, labels=False)
+                
+                # Calculate temporal co-occurrence
+                cooccur_matrix = self._calculate_cooccurrence_matrix(
+                    param_bins, features['TIME'].values
+                )
+                
+                # Calculate co-occurrence scores for each event
+                scores = self._calculate_cooccurrence_scores(
+                    param_bins, features['TIME'].values, cooccur_matrix
+                )
+                cooccurrence_scores.append(scores)
+            
+            if not cooccurrence_scores:
+                print("Warning: No valid parameters for co-occurrence analysis")
+                return np.zeros(len(data)), {
+                    'cooccurrence_scores': np.zeros(len(data)),
+                    'threshold': 0,
+                    'individual_scores': []
+                }
+            
+            # Combine co-occurrence scores
+            combined_scores = np.mean(cooccurrence_scores, axis=0)
+            
+            # Identify noise based on low co-occurrence (isolated events)
+            threshold = np.percentile(combined_scores, 20)  # Bottom 20% as potential noise
+            noise_predictions = (combined_scores < threshold).astype(int)
+            
+            return noise_predictions, {
+                'cooccurrence_scores': combined_scores,
+                'threshold': threshold,
+                'individual_scores': cooccurrence_scores
+            }
+            
+        except Exception as e:
+            print(f"Error in temporal co-occurrence analysis: {e}")
+            # Return zeros as fallback
+            return np.zeros(len(data)), {
+                'cooccurrence_scores': np.zeros(len(data)),
+                'threshold': 0,
+                'individual_scores': []
+            }
     
     def _calculate_cooccurrence_matrix(self, param_bins, times):
         """Calculate temporal co-occurrence matrix."""
-        n_bins = int(np.nanmax(param_bins)) + 1
+        # Handle NaN values in param_bins
+        valid_mask = ~np.isnan(param_bins)
+        param_bins_clean = param_bins[valid_mask]
+        times_clean = times[valid_mask]
+        
+        if len(param_bins_clean) == 0:
+            return np.zeros((1, 1))
+        
+        n_bins = int(np.nanmax(param_bins_clean)) + 1
         cooccur_matrix = np.zeros((n_bins, n_bins))
         
-        for i in range(len(param_bins)):
-            if np.isnan(param_bins[i]):
-                continue
-                
-            t = times[i]
-            bin_i = int(param_bins[i])
+        for i in range(len(param_bins_clean)):
+            t = times_clean[i]
+            bin_i = int(param_bins_clean[i])
             
             # Find events within time window
-            window_mask = (np.abs(times - t) <= self.time_window) & (np.arange(len(times)) != i)
-            window_bins = param_bins[window_mask]
+            window_mask = (np.abs(times_clean - t) <= self.time_window) & (np.arange(len(times_clean)) != i)
+            window_bins = param_bins_clean[window_mask]
             
             # Update co-occurrence matrix
             for bin_j in window_bins:
