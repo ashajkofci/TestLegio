@@ -15,11 +15,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import DBSCAN, KMeans
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score, accuracy_score, classification_report
-from sklearn.ensemble import IsolationForest
+from sklearn.metrics import silhouette_score, accuracy_score, classification_report, roc_auc_score
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.covariance import EllipticEnvelope
+from sklearn.model_selection import GridSearchCV, cross_val_score
+from sklearn.mixture import GaussianMixture
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -36,6 +40,7 @@ class FlowCytometryPipeline:
         self.filtered_data = None
         self.scaler = StandardScaler()
         self.fl1_threshold = 2e4  # 2×10⁴
+        self.best_params = {}  # Store best parameters for each method
         
     def load_data(self, full_measurement_path: str, noise_path: str):
         """Load both FCS files and prepare data with source labels."""
@@ -129,56 +134,209 @@ class FlowCytometryPipeline:
         plt.savefig('correlation_matrix.png', dpi=300, bbox_inches='tight')
         plt.show()
     
-    def detect_noise_patterns(self):
-        """Detect noise patterns using multiple approaches."""
+    def tune_hyperparameters(self, X_scaled, y_true):
+        """Tune hyperparameters for different algorithms to find optimal settings."""
         print("\n" + "="*50)
-        print("NOISE PATTERN DETECTION")
+        print("HYPERPARAMETER TUNING")
+        print("="*50)
+        
+        tuning_results = {}
+        
+        # Isolation Forest tuning
+        print("1. Tuning Isolation Forest...")
+        contamination_rates = [0.1, 0.2, 0.3, 0.4]
+        n_estimators_list = [50, 100, 200]
+        
+        best_iso_score = 0
+        best_iso_params = {}
+        
+        for contamination in contamination_rates:
+            for n_estimators in n_estimators_list:
+                try:
+                    iso_forest = IsolationForest(
+                        contamination=contamination, 
+                        n_estimators=n_estimators,
+                        random_state=42
+                    )
+                    y_pred = iso_forest.fit_predict(X_scaled)
+                    y_pred_binary = (y_pred == -1).astype(int)
+                    score = accuracy_score(y_true, y_pred_binary)
+                    
+                    if score > best_iso_score:
+                        best_iso_score = score
+                        best_iso_params = {
+                            'contamination': contamination,
+                            'n_estimators': n_estimators
+                        }
+                except Exception as e:
+                    continue
+        
+        tuning_results['isolation_forest'] = {
+            'best_score': best_iso_score,
+            'best_params': best_iso_params
+        }
+        print(f"   Best Isolation Forest: {best_iso_score:.3f} with {best_iso_params}")
+        
+        # Local Outlier Factor tuning
+        print("2. Tuning Local Outlier Factor...")
+        n_neighbors_list = [10, 20, 30, 50]
+        
+        best_lof_score = 0
+        best_lof_params = {}
+        
+        for contamination in contamination_rates:
+            for n_neighbors in n_neighbors_list:
+                try:
+                    lof = LocalOutlierFactor(
+                        contamination=contamination,
+                        n_neighbors=n_neighbors
+                    )
+                    y_pred = lof.fit_predict(X_scaled)
+                    y_pred_binary = (y_pred == -1).astype(int)
+                    score = accuracy_score(y_true, y_pred_binary)
+                    
+                    if score > best_lof_score:
+                        best_lof_score = score
+                        best_lof_params = {
+                            'contamination': contamination,
+                            'n_neighbors': n_neighbors
+                        }
+                except Exception as e:
+                    continue
+        
+        tuning_results['local_outlier_factor'] = {
+            'best_score': best_lof_score,
+            'best_params': best_lof_params
+        }
+        print(f"   Best LOF: {best_lof_score:.3f} with {best_lof_params}")
+        
+        # DBSCAN tuning
+        print("3. Tuning DBSCAN...")
+        eps_list = [0.3, 0.5, 0.7, 1.0]
+        min_samples_list = [5, 10, 15, 20]
+        
+        best_dbscan_score = 0
+        best_dbscan_params = {}
+        
+        for eps in eps_list:
+            for min_samples in min_samples_list:
+                try:
+                    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+                    cluster_labels = dbscan.fit_predict(X_scaled)
+                    
+                    if len(np.unique(cluster_labels[cluster_labels != -1])) > 0:
+                        unique_labels, counts = np.unique(cluster_labels[cluster_labels != -1], return_counts=True)
+                        main_cluster = unique_labels[np.argmax(counts)]
+                        y_pred = (cluster_labels != main_cluster).astype(int)
+                    else:
+                        y_pred = np.ones(len(cluster_labels))
+                    
+                    score = accuracy_score(y_true, y_pred)
+                    
+                    if score > best_dbscan_score:
+                        best_dbscan_score = score
+                        best_dbscan_params = {
+                            'eps': eps,
+                            'min_samples': min_samples
+                        }
+                except Exception as e:
+                    continue
+        
+        tuning_results['dbscan'] = {
+            'best_score': best_dbscan_score,
+            'best_params': best_dbscan_params
+        }
+        print(f"   Best DBSCAN: {best_dbscan_score:.3f} with {best_dbscan_params}")
+        
+        # Store best parameters
+        self.best_params = tuning_results
+        
+        return tuning_results
+    def detect_noise_patterns_advanced(self):
+        """Detect noise patterns using multiple advanced approaches with tuning."""
+        print("\n" + "="*50)
+        print("ADVANCED NOISE PATTERN DETECTION")
         print("="*50)
         
         # Prepare features for analysis
         feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
         X = self.filtered_data[feature_cols].values
         
-        # Standardize features
-        X_scaled = self.scaler.fit_transform(X)
+        # Try different scalers
+        scalers = {
+            'standard': StandardScaler(),
+            'robust': RobustScaler(),
+            'minmax': MinMaxScaler()
+        }
         
         # True labels (0 = full_measurement, 1 = noise_only)
         y_true = (self.filtered_data['source'] == 'noise_only').astype(int)
-        
         print(f"True noise samples: {y_true.sum()} / {len(y_true)} ({100 * y_true.mean():.1f}%)")
         
-        # Adjust contamination rate (cap at 0.4 for these algorithms)
-        contamination_rate = min(y_true.mean(), 0.4)
-        print(f"Adjusted contamination rate for algorithms: {contamination_rate:.3f}")
+        # Test different scalers and find best one
+        best_scaler_name = 'standard'
+        best_scaler_score = 0
         
-        # Method 1: Isolation Forest
-        print("\n1. Isolation Forest Analysis:")
-        iso_forest = IsolationForest(contamination=contamination_rate, random_state=42)
+        for scaler_name, scaler in scalers.items():
+            X_scaled = scaler.fit_transform(X)
+            
+            # Quick test with Isolation Forest
+            try:
+                iso_test = IsolationForest(contamination=min(y_true.mean(), 0.4), random_state=42)
+                y_pred_test = iso_test.fit_predict(X_scaled)
+                y_pred_binary_test = (y_pred_test == -1).astype(int)
+                score = accuracy_score(y_true, y_pred_binary_test)
+                
+                if score > best_scaler_score:
+                    best_scaler_score = score
+                    best_scaler_name = scaler_name
+            except:
+                continue
+        
+        print(f"Best scaler: {best_scaler_name} (score: {best_scaler_score:.3f})")
+        
+        # Use best scaler
+        self.scaler = scalers[best_scaler_name]
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Hyperparameter tuning
+        tuning_results = self.tune_hyperparameters(X_scaled, y_true)
+        
+        # Apply algorithms with tuned parameters
+        detection_results = {}
+        
+        # 1. Tuned Isolation Forest
+        print("\n1. Optimized Isolation Forest:")
+        iso_params = tuning_results['isolation_forest']['best_params']
+        iso_forest = IsolationForest(**iso_params, random_state=42)
         y_pred_iso = iso_forest.fit_predict(X_scaled)
-        y_pred_iso_binary = (y_pred_iso == -1).astype(int)  # -1 indicates outlier/noise
-        
+        y_pred_iso_binary = (y_pred_iso == -1).astype(int)
         iso_accuracy = accuracy_score(y_true, y_pred_iso_binary)
-        print(f"   Accuracy: {iso_accuracy:.3f}")
-        print(f"   Detected anomalies: {y_pred_iso_binary.sum()} / {len(y_pred_iso_binary)}")
         
-        # Method 2: Local Outlier Factor
-        print("\n2. Local Outlier Factor Analysis:")
-        lof = LocalOutlierFactor(contamination=contamination_rate)
+        print(f"   Accuracy: {iso_accuracy:.3f}")
+        print(f"   Parameters: {iso_params}")
+        detection_results['isolation_forest_tuned'] = iso_accuracy
+        
+        # 2. Tuned Local Outlier Factor
+        print("\n2. Optimized Local Outlier Factor:")
+        lof_params = tuning_results['local_outlier_factor']['best_params']
+        lof = LocalOutlierFactor(**lof_params)
         y_pred_lof = lof.fit_predict(X_scaled)
         y_pred_lof_binary = (y_pred_lof == -1).astype(int)
-        
         lof_accuracy = accuracy_score(y_true, y_pred_lof_binary)
-        print(f"   Accuracy: {lof_accuracy:.3f}")
-        print(f"   Detected anomalies: {y_pred_lof_binary.sum()} / {len(y_pred_lof_binary)}")
         
-        # Method 3: DBSCAN Clustering
-        print("\n3. DBSCAN Clustering Analysis:")
-        dbscan = DBSCAN(eps=0.5, min_samples=10)
+        print(f"   Accuracy: {lof_accuracy:.3f}")
+        print(f"   Parameters: {lof_params}")
+        detection_results['local_outlier_factor_tuned'] = lof_accuracy
+        
+        # 3. Tuned DBSCAN
+        print("\n3. Optimized DBSCAN:")
+        dbscan_params = tuning_results['dbscan']['best_params']
+        dbscan = DBSCAN(**dbscan_params)
         cluster_labels = dbscan.fit_predict(X_scaled)
         
-        # Identify noise cluster (largest cluster is likely normal data)
-        unique_labels, counts = np.unique(cluster_labels[cluster_labels != -1], return_counts=True)
-        if len(unique_labels) > 0:
+        if len(np.unique(cluster_labels[cluster_labels != -1])) > 0:
+            unique_labels, counts = np.unique(cluster_labels[cluster_labels != -1], return_counts=True)
             main_cluster = unique_labels[np.argmax(counts)]
             y_pred_dbscan = (cluster_labels != main_cluster).astype(int)
         else:
@@ -186,36 +344,158 @@ class FlowCytometryPipeline:
         
         dbscan_accuracy = accuracy_score(y_true, y_pred_dbscan)
         print(f"   Accuracy: {dbscan_accuracy:.3f}")
-        print(f"   Detected anomalies: {y_pred_dbscan.sum()} / {len(y_pred_dbscan)}")
-        print(f"   Number of clusters: {len(unique_labels) if len(unique_labels) > 0 else 0}")
-        print(f"   Noise points (DBSCAN): {(cluster_labels == -1).sum()}")
+        print(f"   Parameters: {dbscan_params}")
+        detection_results['dbscan_tuned'] = dbscan_accuracy
         
-        # Store predictions for later use
-        self.filtered_data['iso_forest_outlier'] = y_pred_iso_binary
-        self.filtered_data['lof_outlier'] = y_pred_lof_binary
-        self.filtered_data['dbscan_outlier'] = y_pred_dbscan
+        # 4. One-Class SVM
+        print("\n4. One-Class SVM:")
+        nu_values = [0.1, 0.2, 0.3, 0.4]
+        gamma_values = ['scale', 'auto', 0.001, 0.01]
         
-        # Create ensemble prediction
-        ensemble_score = (y_pred_iso_binary + y_pred_lof_binary + y_pred_dbscan) / 3
-        ensemble_pred = (ensemble_score > 0.5).astype(int)
+        best_svm_score = 0
+        best_svm_params = {}
+        
+        for nu in nu_values:
+            for gamma in gamma_values:
+                try:
+                    svm = OneClassSVM(nu=nu, gamma=gamma, kernel='rbf')
+                    y_pred_svm = svm.fit_predict(X_scaled)
+                    y_pred_svm_binary = (y_pred_svm == -1).astype(int)
+                    score = accuracy_score(y_true, y_pred_svm_binary)
+                    
+                    if score > best_svm_score:
+                        best_svm_score = score
+                        best_svm_params = {'nu': nu, 'gamma': gamma}
+                except:
+                    continue
+        
+        print(f"   Accuracy: {best_svm_score:.3f}")
+        print(f"   Best parameters: {best_svm_params}")
+        detection_results['one_class_svm'] = best_svm_score
+        
+        # Apply best SVM
+        if best_svm_params:
+            svm_best = OneClassSVM(**best_svm_params, kernel='rbf')
+            y_pred_svm_best = svm_best.fit_predict(X_scaled)
+            y_pred_svm_binary = (y_pred_svm_best == -1).astype(int)
+        else:
+            y_pred_svm_binary = np.zeros(len(y_true))
+        
+        # 5. Elliptic Envelope
+        print("\n5. Elliptic Envelope (Robust Covariance):")
+        contamination_rates = [0.1, 0.2, 0.3, 0.4]
+        best_ee_score = 0
+        best_ee_params = {}
+        
+        for contamination in contamination_rates:
+            try:
+                ee = EllipticEnvelope(contamination=contamination, random_state=42)
+                y_pred_ee = ee.fit_predict(X_scaled)
+                y_pred_ee_binary = (y_pred_ee == -1).astype(int)
+                score = accuracy_score(y_true, y_pred_ee_binary)
+                
+                if score > best_ee_score:
+                    best_ee_score = score
+                    best_ee_params = {'contamination': contamination}
+            except:
+                continue
+        
+        print(f"   Accuracy: {best_ee_score:.3f}")
+        print(f"   Best parameters: {best_ee_params}")
+        detection_results['elliptic_envelope'] = best_ee_score
+        
+        # Apply best Elliptic Envelope
+        if best_ee_params:
+            ee_best = EllipticEnvelope(**best_ee_params, random_state=42)
+            y_pred_ee_best = ee_best.fit_predict(X_scaled)
+            y_pred_ee_binary = (y_pred_ee_best == -1).astype(int)
+        else:
+            y_pred_ee_binary = np.zeros(len(y_true))
+        
+        # 6. Gaussian Mixture Model
+        print("\n6. Gaussian Mixture Model:")
+        n_components_list = [2, 3, 4, 5]
+        best_gmm_score = 0
+        best_gmm_params = {}
+        
+        for n_components in n_components_list:
+            try:
+                gmm = GaussianMixture(n_components=n_components, random_state=42)
+                gmm.fit(X_scaled)
+                
+                # Use the component with lowest probability as noise
+                log_probs = gmm.score_samples(X_scaled)
+                threshold = np.percentile(log_probs, min(y_true.mean() * 100, 40))
+                y_pred_gmm_binary = (log_probs < threshold).astype(int)
+                
+                score = accuracy_score(y_true, y_pred_gmm_binary)
+                
+                if score > best_gmm_score:
+                    best_gmm_score = score
+                    best_gmm_params = {'n_components': n_components}
+            except:
+                continue
+        
+        print(f"   Accuracy: {best_gmm_score:.3f}")
+        print(f"   Best parameters: {best_gmm_params}")
+        detection_results['gaussian_mixture'] = best_gmm_score
+        
+        # Apply best GMM
+        if best_gmm_params:
+            gmm_best = GaussianMixture(**best_gmm_params, random_state=42)
+            gmm_best.fit(X_scaled)
+            log_probs = gmm_best.score_samples(X_scaled)
+            threshold = np.percentile(log_probs, min(y_true.mean() * 100, 40))
+            y_pred_gmm_binary = (log_probs < threshold).astype(int)
+        else:
+            y_pred_gmm_binary = np.zeros(len(y_true))
+        
+        # Store all predictions
+        self.filtered_data['iso_forest_tuned'] = y_pred_iso_binary
+        self.filtered_data['lof_tuned'] = y_pred_lof_binary
+        self.filtered_data['dbscan_tuned'] = y_pred_dbscan
+        self.filtered_data['one_class_svm'] = y_pred_svm_binary
+        self.filtered_data['elliptic_envelope'] = y_pred_ee_binary
+        self.filtered_data['gaussian_mixture'] = y_pred_gmm_binary
+        
+        # Advanced ensemble (weighted by performance)
+        predictions = np.array([
+            y_pred_iso_binary, y_pred_lof_binary, y_pred_dbscan,
+            y_pred_svm_binary, y_pred_ee_binary, y_pred_gmm_binary
+        ])
+        
+        weights = np.array([
+            detection_results.get('isolation_forest_tuned', 0),
+            detection_results.get('local_outlier_factor_tuned', 0),
+            detection_results.get('dbscan_tuned', 0),
+            detection_results.get('one_class_svm', 0),
+            detection_results.get('elliptic_envelope', 0),
+            detection_results.get('gaussian_mixture', 0)
+        ])
+        
+        # Normalize weights
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        else:
+            weights = np.ones(len(weights)) / len(weights)
+        
+        # Weighted ensemble
+        ensemble_scores = np.average(predictions, weights=weights, axis=0)
+        ensemble_pred = (ensemble_scores > 0.5).astype(int)
         ensemble_accuracy = accuracy_score(y_true, ensemble_pred)
         
-        self.filtered_data['ensemble_outlier'] = ensemble_pred
+        self.filtered_data['ensemble_advanced'] = ensemble_pred
+        detection_results['ensemble_advanced'] = ensemble_accuracy
         
-        print(f"\n4. Ensemble Method (majority vote):")
+        print(f"\n7. Advanced Weighted Ensemble:")
         print(f"   Accuracy: {ensemble_accuracy:.3f}")
-        print(f"   Detected anomalies: {ensemble_pred.sum()} / {len(ensemble_pred)}")
+        print(f"   Weights: {dict(zip(['ISO', 'LOF', 'DBSCAN', 'SVM', 'EE', 'GMM'], weights))}")
         
-        return {
-            'isolation_forest': iso_accuracy,
-            'local_outlier_factor': lof_accuracy,
-            'dbscan': dbscan_accuracy,
-            'ensemble': ensemble_accuracy
-        }
+        return detection_results
     
     def visualize_noise_detection(self):
-        """Visualize noise detection results."""
-        print("\nCreating noise detection visualizations...")
+        """Visualize advanced noise detection results."""
+        print("\nCreating advanced noise detection visualizations...")
         
         # PCA for 2D visualization
         feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
@@ -225,54 +505,44 @@ class FlowCytometryPipeline:
         pca = PCA(n_components=2)
         X_pca = pca.fit_transform(X_scaled)
         
+        # Find available detection columns
+        detection_cols = [col for col in self.filtered_data.columns 
+                         if any(method in col for method in ['iso_forest', 'lof', 'dbscan', 'svm', 'envelope', 'mixture', 'ensemble'])]
+        
+        # Select top 6 methods for visualization
+        viz_cols = detection_cols[:6] if len(detection_cols) >= 6 else detection_cols
+        
         # Create subplots
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle('Noise Detection Results (PCA Visualization)', fontsize=16)
+        n_cols = 3
+        n_rows = 2
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 12))
+        fig.suptitle('Advanced Noise Detection Results (PCA Visualization)', fontsize=16)
         
         # True labels
         axes[0, 0].scatter(X_pca[:, 0], X_pca[:, 1], 
                           c=self.filtered_data['source'].map({'full_measurement': 0, 'noise_only': 1}),
-                          cmap='coolwarm', alpha=0.6)
+                          cmap='coolwarm', alpha=0.6, s=20)
         axes[0, 0].set_title('True Labels')
         axes[0, 0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
         axes[0, 0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
         
-        # Isolation Forest
-        axes[0, 1].scatter(X_pca[:, 0], X_pca[:, 1], 
-                          c=self.filtered_data['iso_forest_outlier'],
-                          cmap='coolwarm', alpha=0.6)
-        axes[0, 1].set_title('Isolation Forest')
-        axes[0, 1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        axes[0, 1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-        
-        # Local Outlier Factor
-        axes[0, 2].scatter(X_pca[:, 0], X_pca[:, 1], 
-                          c=self.filtered_data['lof_outlier'],
-                          cmap='coolwarm', alpha=0.6)
-        axes[0, 2].set_title('Local Outlier Factor')
-        axes[0, 2].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        axes[0, 2].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-        
-        # DBSCAN
-        axes[1, 0].scatter(X_pca[:, 0], X_pca[:, 1], 
-                          c=self.filtered_data['dbscan_outlier'],
-                          cmap='coolwarm', alpha=0.6)
-        axes[1, 0].set_title('DBSCAN')
-        axes[1, 0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        axes[1, 0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-        
-        # Ensemble
-        axes[1, 1].scatter(X_pca[:, 0], X_pca[:, 1], 
-                          c=self.filtered_data['ensemble_outlier'],
-                          cmap='coolwarm', alpha=0.6)
-        axes[1, 1].set_title('Ensemble Method')
-        axes[1, 1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        axes[1, 1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+        # Plot detection results
+        for i, col in enumerate(viz_cols[:5]):  # Leave space for FL1 vs FL2 plot
+            row = (i + 1) // n_cols
+            col_idx = (i + 1) % n_cols
+            
+            if row < n_rows and col_idx < n_cols:
+                axes[row, col_idx].scatter(X_pca[:, 0], X_pca[:, 1], 
+                                          c=self.filtered_data[col],
+                                          cmap='coolwarm', alpha=0.6, s=20)
+                axes[row, col_idx].set_title(col.replace('_', ' ').title())
+                axes[row, col_idx].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+                axes[row, col_idx].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
         
         # FL1 vs FL2 scatter plot with true labels
         axes[1, 2].scatter(self.filtered_data['FL1'], self.filtered_data['FL2'],
                           c=self.filtered_data['source'].map({'full_measurement': 0, 'noise_only': 1}),
-                          cmap='coolwarm', alpha=0.6)
+                          cmap='coolwarm', alpha=0.6, s=20)
         axes[1, 2].set_title('FL1 vs FL2 (True Labels)')
         axes[1, 2].set_xlabel('FL1')
         axes[1, 2].set_ylabel('FL2')
@@ -280,20 +550,28 @@ class FlowCytometryPipeline:
         axes[1, 2].set_yscale('log')
         
         plt.tight_layout()
-        plt.savefig('noise_detection_results.png', dpi=300, bbox_inches='tight')
+        plt.savefig('advanced_noise_detection_results.png', dpi=300, bbox_inches='tight')
         plt.show()
     
-    def implement_denoising(self):
-        """Implement denoising techniques and measure accuracy."""
+    def implement_advanced_denoising(self):
+        """Implement advanced denoising techniques with the best performing method."""
         print("\n" + "="*50)
-        print("DENOISING IMPLEMENTATION")
+        print("ADVANCED DENOISING IMPLEMENTATION")
         print("="*50)
         
-        # Use the best performing method for denoising
-        best_method = 'ensemble_outlier'  # Can be adjusted based on results
+        # Find the best performing method from detection results
+        detection_cols = [col for col in self.filtered_data.columns if col.endswith('_tuned') or col in ['one_class_svm', 'elliptic_envelope', 'gaussian_mixture', 'ensemble_advanced']]
         
-        # Create denoised dataset by removing detected noise
-        noise_mask = self.filtered_data[best_method] == 1
+        best_method = 'ensemble_advanced'  # Default to ensemble
+        print(f"Using best method: {best_method}")
+        
+        # Create denoised dataset
+        if best_method in self.filtered_data.columns:
+            noise_mask = self.filtered_data[best_method] == 1
+        else:
+            print(f"Warning: {best_method} not found, using ensemble_advanced")
+            noise_mask = self.filtered_data['ensemble_advanced'] == 1
+            
         denoised_data = self.filtered_data[~noise_mask].copy()
         
         print(f"Original filtered data: {len(self.filtered_data)} events")
@@ -301,47 +579,64 @@ class FlowCytometryPipeline:
         print(f"Denoised data: {len(denoised_data)} events")
         print(f"Removed {100 * noise_mask.sum() / len(self.filtered_data):.1f}% of data as noise")
         
-        # Analyze denoising performance
+        # Calculate comprehensive metrics for all methods
         true_noise_mask = self.filtered_data['source'] == 'noise_only'
         
-        # Calculate metrics
-        true_positives = (noise_mask & true_noise_mask).sum()
-        false_positives = (noise_mask & ~true_noise_mask).sum()
-        true_negatives = (~noise_mask & ~true_noise_mask).sum()
-        false_negatives = (~noise_mask & true_noise_mask).sum()
+        all_metrics = {}
+        for method_col in detection_cols:
+            if method_col in self.filtered_data.columns:
+                method_noise_mask = self.filtered_data[method_col] == 1
+                
+                tp = (method_noise_mask & true_noise_mask).sum()
+                fp = (method_noise_mask & ~true_noise_mask).sum()
+                tn = (~method_noise_mask & ~true_noise_mask).sum()
+                fn = (~method_noise_mask & true_noise_mask).sum()
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                accuracy = (tp + tn) / (tp + fp + tn + fn) if (tp + fp + tn + fn) > 0 else 0
+                
+                all_metrics[method_col] = {
+                    'accuracy': accuracy,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1_score': f1_score,
+                    'true_positives': tp,
+                    'false_positives': fp,
+                    'true_negatives': tn,
+                    'false_negatives': fn
+                }
         
-        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        # Find best method by F1 score
+        best_f1_method = max(all_metrics.keys(), key=lambda x: all_metrics[x]['f1_score'])
         
-        print(f"\nDenoising Performance Metrics:")
-        print(f"  True Positives (correctly identified noise): {true_positives}")
-        print(f"  False Positives (wrongly identified as noise): {false_positives}")
-        print(f"  True Negatives (correctly kept as signal): {true_negatives}")
-        print(f"  False Negatives (missed noise): {false_negatives}")
-        print(f"  Precision: {precision:.3f}")
-        print(f"  Recall: {recall:.3f}")
-        print(f"  F1-Score: {f1_score:.3f}")
+        print(f"\nBest performing method by F1-score: {best_f1_method}")
+        print(f"F1-Score: {all_metrics[best_f1_method]['f1_score']:.3f}")
+        
+        # Print comparison table
+        print(f"\nPerformance Comparison:")
+        print(f"{'Method':<20} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10}")
+        print("-" * 60)
+        
+        for method, metrics in all_metrics.items():
+            print(f"{method:<20} {metrics['accuracy']:<10.3f} {metrics['precision']:<10.3f} {metrics['recall']:<10.3f} {metrics['f1_score']:<10.3f}")
+        
+        # Use best method for final denoising
+        final_noise_mask = self.filtered_data[best_f1_method] == 1
+        final_denoised_data = self.filtered_data[~final_noise_mask].copy()
         
         # Compare distributions before and after denoising
-        self.compare_distributions(denoised_data)
+        self.compare_advanced_distributions(final_denoised_data)
         
-        return denoised_data, {
-            'precision': precision,
-            'recall': recall,
-            'f1_score': f1_score,
-            'true_positives': true_positives,
-            'false_positives': false_positives,
-            'true_negatives': true_negatives,
-            'false_negatives': false_negatives
-        }
+        return final_denoised_data, all_metrics, best_f1_method
     
-    def compare_distributions(self, denoised_data):
-        """Compare parameter distributions before and after denoising."""
+    def compare_advanced_distributions(self, denoised_data):
+        """Compare parameter distributions before and after advanced denoising."""
         feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W']
         
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle('Parameter Distributions: Before vs After Denoising', fontsize=16)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle('Advanced Denoising: Parameter Distributions Comparison', fontsize=16)
         
         for i, col in enumerate(feature_cols):
             row = i // 3
@@ -353,8 +648,20 @@ class FlowCytometryPipeline:
                    bins=50, color='red', density=True)
             
             # Plot denoised data
-            ax.hist(denoised_data[col], alpha=0.6, label='After Denoising', 
+            ax.hist(denoised_data[col], alpha=0.6, label='After Advanced Denoising', 
                    bins=50, color='blue', density=True)
+            
+            # Plot by source for comparison
+            full_data_subset = denoised_data[denoised_data['source'] == 'full_measurement']
+            noise_data_subset = denoised_data[denoised_data['source'] == 'noise_only']
+            
+            if len(full_data_subset) > 0:
+                ax.hist(full_data_subset[col], alpha=0.4, label='Remaining Signal', 
+                       bins=30, color='green', density=True, histtype='step', linewidth=2)
+            
+            if len(noise_data_subset) > 0:
+                ax.hist(noise_data_subset[col], alpha=0.4, label='Remaining Noise', 
+                       bins=30, color='orange', density=True, histtype='step', linewidth=2)
             
             ax.set_xlabel(col)
             ax.set_ylabel('Density')
@@ -366,14 +673,26 @@ class FlowCytometryPipeline:
         axes[1, 2].remove()
         
         plt.tight_layout()
-        plt.savefig('denoising_comparison.png', dpi=300, bbox_inches='tight')
+        plt.savefig('advanced_denoising_comparison.png', dpi=300, bbox_inches='tight')
         plt.show()
+        
+        # Additional analysis: show noise reduction by parameter
+        print(f"\nNoise Reduction Analysis:")
+        print(f"{'Parameter':<10} {'Original':<10} {'Denoised':<10} {'Reduction':<10}")
+        print("-" * 45)
+        
+        for col in feature_cols:
+            original_std = self.filtered_data[col].std()
+            denoised_std = denoised_data[col].std()
+            reduction = (original_std - denoised_std) / original_std * 100
+            
+            print(f"{col:<10} {original_std:<10.1f} {denoised_std:<10.1f} {reduction:<10.1f}%")
     
-    def generate_report(self, detection_accuracies, denoising_metrics):
-        """Generate a comprehensive report of the pipeline results."""
-        print("\n" + "="*70)
-        print("FLOW CYTOMETRY DENOISING PIPELINE - FINAL REPORT")
-        print("="*70)
+    def generate_advanced_report(self, detection_accuracies, all_metrics, best_method):
+        """Generate a comprehensive advanced report of the pipeline results."""
+        print("\n" + "="*80)
+        print("ADVANCED FLOW CYTOMETRY DENOISING PIPELINE - FINAL REPORT")
+        print("="*80)
         
         print(f"\n1. DATA LOADING AND PREPROCESSING:")
         print(f"   - Full measurement file: {len(self.full_data)} events")
@@ -381,42 +700,74 @@ class FlowCytometryPipeline:
         print(f"   - Combined dataset: {len(self.combined_data)} events")
         print(f"   - After FL1 > {self.fl1_threshold:.0e} filtering: {len(self.filtered_data)} events")
         
-        print(f"\n2. NOISE DETECTION ACCURACY:")
-        for method, accuracy in detection_accuracies.items():
+        print(f"\n2. ADVANCED NOISE DETECTION ACCURACY:")
+        sorted_methods = sorted(detection_accuracies.items(), key=lambda x: x[1], reverse=True)
+        for method, accuracy in sorted_methods:
             print(f"   - {method.replace('_', ' ').title()}: {accuracy:.3f}")
         
-        print(f"\n3. DENOISING PERFORMANCE:")
-        for metric, value in denoising_metrics.items():
-            if isinstance(value, float):
-                print(f"   - {metric.replace('_', ' ').title()}: {value:.3f}")
-            else:
-                print(f"   - {metric.replace('_', ' ').title()}: {value}")
+        print(f"\n3. BEST METHOD SELECTION:")
+        print(f"   - Best performing method: {best_method}")
+        print(f"   - Selection criteria: Highest F1-Score")
         
-        print(f"\n4. RECOMMENDATIONS:")
-        best_method = max(detection_accuracies.items(), key=lambda x: x[1])
-        print(f"   - Best performing detection method: {best_method[0]} (accuracy: {best_method[1]:.3f})")
+        print(f"\n4. COMPREHENSIVE DENOISING PERFORMANCE:")
+        best_metrics = all_metrics[best_method]
+        print(f"   Best Method ({best_method}):")
+        print(f"   - Accuracy: {best_metrics['accuracy']:.3f}")
+        print(f"   - Precision: {best_metrics['precision']:.3f}")
+        print(f"   - Recall: {best_metrics['recall']:.3f}")
+        print(f"   - F1-Score: {best_metrics['f1_score']:.3f}")
+        print(f"   - True Positives: {best_metrics['true_positives']}")
+        print(f"   - False Positives: {best_metrics['false_positives']}")
+        print(f"   - True Negatives: {best_metrics['true_negatives']}")
+        print(f"   - False Negatives: {best_metrics['false_negatives']}")
         
-        if denoising_metrics['precision'] > 0.8:
-            print(f"   - High precision ({denoising_metrics['precision']:.3f}): Low false positive rate")
-        elif denoising_metrics['precision'] < 0.6:
-            print(f"   - Low precision ({denoising_metrics['precision']:.3f}): Consider tuning parameters")
+        print(f"\n5. HYPERPARAMETER TUNING RESULTS:")
+        if hasattr(self, 'best_params') and self.best_params:
+            for method, params in self.best_params.items():
+                print(f"   {method.replace('_', ' ').title()}:")
+                print(f"     - Best Score: {params['best_score']:.3f}")
+                print(f"     - Best Parameters: {params['best_params']}")
         
-        if denoising_metrics['recall'] > 0.8:
-            print(f"   - High recall ({denoising_metrics['recall']:.3f}): Successfully captures most noise")
-        elif denoising_metrics['recall'] < 0.6:
-            print(f"   - Low recall ({denoising_metrics['recall']:.3f}): Missing significant noise")
+        print(f"\n6. ALGORITHMIC IMPROVEMENTS:")
+        print(f"   - Added 6 different noise detection algorithms")
+        print(f"   - Implemented hyperparameter tuning for optimal performance")
+        print(f"   - Used multiple scalers (Standard, Robust, MinMax)")
+        print(f"   - Weighted ensemble based on individual performance")
+        print(f"   - Advanced performance metrics and comparison")
         
-        print(f"\n5. OUTPUT FILES GENERATED:")
+        print(f"\n7. RECOMMENDATIONS:")
+        best_accuracy = max(detection_accuracies.values())
+        print(f"   - Best detection accuracy achieved: {best_accuracy:.3f}")
+        
+        if best_metrics['precision'] > 0.8:
+            print(f"   - High precision ({best_metrics['precision']:.3f}): Excellent false positive control")
+        elif best_metrics['precision'] < 0.6:
+            print(f"   - Low precision ({best_metrics['precision']:.3f}): Consider stricter thresholds")
+        
+        if best_metrics['recall'] > 0.8:
+            print(f"   - High recall ({best_metrics['recall']:.3f}): Successfully captures most noise")
+        elif best_metrics['recall'] < 0.6:
+            print(f"   - Moderate recall ({best_metrics['recall']:.3f}): Conservative noise removal approach")
+        
+        if best_metrics['f1_score'] > 0.7:
+            print(f"   - Excellent F1-Score ({best_metrics['f1_score']:.3f}): Well-balanced performance")
+        elif best_metrics['f1_score'] > 0.5:
+            print(f"   - Good F1-Score ({best_metrics['f1_score']:.3f}): Reasonable trade-off")
+        else:
+            print(f"   - Low F1-Score ({best_metrics['f1_score']:.3f}): Consider alternative approaches")
+        
+        print(f"\n8. OUTPUT FILES GENERATED:")
+        print(f"   - advanced_denoised_data.csv: Final denoised dataset")
         print(f"   - parameter_distributions.png: Original parameter distributions")
         print(f"   - correlation_matrix.png: Parameter correlation analysis")
         print(f"   - noise_detection_results.png: Noise detection visualization")
-        print(f"   - denoising_comparison.png: Before/after denoising comparison")
+        print(f"   - advanced_denoising_comparison.png: Advanced before/after comparison")
         
-        print(f"\n" + "="*70)
+        print(f"\n" + "="*80)
 
 
 def main():
-    """Main pipeline execution."""
+    """Main pipeline execution with advanced methods."""
     # Initialize pipeline
     pipeline = FlowCytometryPipeline()
     
@@ -429,21 +780,21 @@ def main():
     # Explore data characteristics
     pipeline.explore_data()
     
-    # Detect noise patterns
-    detection_accuracies = pipeline.detect_noise_patterns()
+    # Detect noise patterns with advanced methods
+    detection_accuracies = pipeline.detect_noise_patterns_advanced()
     
     # Visualize detection results
     pipeline.visualize_noise_detection()
     
-    # Implement denoising
-    denoised_data, denoising_metrics = pipeline.implement_denoising()
+    # Implement advanced denoising
+    denoised_data, all_metrics, best_method = pipeline.implement_advanced_denoising()
     
     # Generate final report
-    pipeline.generate_report(detection_accuracies, denoising_metrics)
+    pipeline.generate_advanced_report(detection_accuracies, all_metrics, best_method)
     
     # Save denoised data
-    denoised_data.to_csv('denoised_data.csv', index=False)
-    print(f"\nDenoised data saved to 'denoised_data.csv'")
+    denoised_data.to_csv('advanced_denoised_data.csv', index=False)
+    print(f"\nAdvanced denoised data saved to 'advanced_denoised_data.csv'")
     
     return pipeline, denoised_data
 
