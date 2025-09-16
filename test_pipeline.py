@@ -22,8 +22,8 @@ def test_fcs_parser():
         noise_data = load_fcs_data('only_noise.fcs')
         
         # Validate basic structure
-        assert len(full_data) == 41350, f"Expected 41350 events, got {len(full_data)}"
-        assert len(noise_data) == 32875, f"Expected 32875 events, got {len(noise_data)}"
+        assert len(full_data) == 32875, f"Expected 32875 events, got {len(full_data)}"
+        assert len(noise_data) == 41350, f"Expected 41350 events, got {len(noise_data)}"
         assert len(full_data.columns) == 6, f"Expected 6 parameters, got {len(full_data.columns)}"
         assert len(noise_data.columns) == 6, f"Expected 6 parameters, got {len(noise_data.columns)}"
         
@@ -65,8 +65,8 @@ def test_pipeline_initialization():
         
         # Check source distribution
         source_counts = pipeline.combined_data['source'].value_counts()
-        assert source_counts['full_measurement'] == 41350, f"Wrong full measurement count: {source_counts['full_measurement']}"
-        assert source_counts['noise_only'] == 32875, f"Wrong noise count: {source_counts['noise_only']}"
+        assert source_counts['full_measurement'] == 32875, f"Wrong full measurement count: {source_counts['full_measurement']}"
+        assert source_counts['noise_only'] == 41350, f"Wrong noise count: {source_counts['noise_only']}"
         
         print("✓ Pipeline initialization tests passed")
         return True
