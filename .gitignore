@@ -49,3 +49,5 @@ ENV/
 .DS_Store
 Thumbs.db
 .venv/
+trained_models/
+trained_models/*
