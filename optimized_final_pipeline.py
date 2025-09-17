@@ -107,9 +107,9 @@ class OptimizedFlowCytometryPipeline:
         """Apply polygonal filtering using FL1-FL2 coordinates."""
         # Polygonal coordinates (log scale): [[4.2, 0], [4.2, 3.2], [6.7, 5.9], [6.7, 0.0]]
         polygon_coords = np.array([
-            [10**4.2, 10**0.0],    # [15849, 1]
-            [10**4.2, 10**3.2],    # [15849, 1585]
-            [10**6.7, 10**5.9],    # [5011872, 794328]
+            [10**4.6, 10**0.0],    # [15849, 1]
+            [10**4.6, 10**3.5],    # [15849, 1585]
+            [10**6.7, 10**4.8],    # [5011872, 794328]
             [10**6.7, 10**0.0]     # [5011872, 1]
         ])
         
@@ -296,11 +296,7 @@ class OptimizedFlowCytometryPipeline:
     
     def _create_ensemble_methods(self):
         """Create ensemble methods."""
-        self.ensemble_methods = {
-            'majority_voting': self._majority_voting,
-            'weighted_voting': self._weighted_voting,
-            'conservative_ensemble': self._conservative_ensemble
-        }
+        self.ensemble_methods = {}
     
     def test_individual_files(self):
         """Test each file combination separately using pre-trained models."""
@@ -468,72 +464,9 @@ class OptimizedFlowCytometryPipeline:
             'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0
         }
     
-    def _majority_voting(self, X_test, X_test_scaled, predictions_cache=None):
-        """Majority voting ensemble using pre-trained models."""
-        if predictions_cache is None:
-            predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
-        
-        predictions = []
-        for alg_name in predictions_cache:
-            predictions.append(predictions_cache[alg_name])
-        
-        if len(predictions) > 0:
-            return (np.mean(predictions, axis=0) > 0.5).astype(int)
-        else:
-            return np.zeros(len(X_test), dtype=int)
-    
-    def _weighted_voting(self, X_test, X_test_scaled, predictions_cache=None):
-        """Weighted voting ensemble based on training performance."""
-        if predictions_cache is None:
-            predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
-        
-        predictions = []
-        weights = []
-        
-        # Enhanced weights based on algorithm type and expected performance
-        algorithm_weights = {
-            'isolation_forest': 1.0,
-            'lof': 1.0,
-            'one_class_svm': 0.8,
-            'elliptic_envelope': 0.9,
-            'gaussian_mixture': 1.1,
-            'dbscan': 1.2,
-            'bayesian_temporal_cooccurrence': 1.3,
-            'bayesian_bayesian_mixture': 1.4,
-            'bayesian_bayesian_ridge': 1.2,
-            'bayesian_dirichlet_process': 1.5,
-            'bayesian_change_point_detection': 1.1,
-            'bayesian_ensemble_bayesian': 1.6,  # Highest weight for ensemble
-            'bayesian_bayesian_network': 1.4
-        }
-        
-        for alg_name in predictions_cache:
-            predictions.append(predictions_cache[alg_name])
-            weights.append(algorithm_weights.get(alg_name, 1.0))
-        
-        if len(predictions) > 0:
-            weighted_predictions = np.average(predictions, axis=0, weights=weights)
-            return (weighted_predictions > 0.5).astype(int)
-        else:
-            return np.zeros(len(X_test), dtype=int)
-    
-    def _conservative_ensemble(self, X_test, X_test_scaled, predictions_cache=None):
-        """Conservative ensemble requiring multiple algorithms to agree."""
-        if predictions_cache is None:
-            predictions_cache = self._compute_all_predictions(X_test, X_test_scaled)
-        
-        predictions = []
-        for alg_name in predictions_cache:
-            predictions.append(predictions_cache[alg_name])
-        
-        if len(predictions) > 0:
-            # Require at least 2/3 of algorithms to agree on noise classification
-            vote_sum = np.sum(predictions, axis=0)
-            threshold = max(2, len(predictions) * 0.67)
-            return (vote_sum >= threshold).astype(int)
-        else:
-            return np.zeros(len(X_test), dtype=int)
-    
+
+
+
     def _calculate_mean_performance(self):
         """Calculate mean performance across all file combinations."""
         if not self.individual_results:

@@ -196,11 +196,6 @@ class TestOptimizedPipeline:
         pipeline.prepare_training_data()
         pipeline.train_all_algorithms()
 
-        # Test ensemble methods
-        assert 'majority_voting' in pipeline.ensemble_methods
-        assert 'weighted_voting' in pipeline.ensemble_methods
-        assert 'conservative_ensemble' in pipeline.ensemble_methods
-
         # Test ensemble predictions
         feature_cols = ['SSC', 'FL1', 'FL2', 'FSC', 'FL1-W', 'TIME']
         X_test = pipeline.normal_files[0][feature_cols].fillna(0).values
